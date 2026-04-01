@@ -19,7 +19,7 @@ Output JSON example:
       "prices": {
         "100LL_FULL": "7.25",
         "100LL_SELF": "6.70",
-        "JET_A": "7.23"
+        "JET_A_FULL": "7.23"
       }
     }
   ]
@@ -33,6 +33,7 @@ Rules:
 - Prices are always emitted as strings with 2 decimal places
 - If FBO name starts with "More info and photos of ", strip that prefix
 - In addition to 100LL and JET_A, also capture MOGAS, UL94, UL91 when present
+- Support FS, SS, RA, and AS (Assisted/Self Service)
 """
 
 from __future__ import annotations
@@ -57,6 +58,13 @@ SUPPORTED_FUELS = [
     "UL94",
     "UL91",
 ]
+
+SERVICE_MAP = {
+    "FS": "FULL",
+    "SS": "SELF",
+    "RA": "RA",
+    "AS": "SELF",  # Assisted/Self Service
+}
 
 
 def clean_text(text: str) -> str:
@@ -203,7 +211,7 @@ def parse_prices_from_text(text: str) -> Dict[str, Optional[float]]:
 
     row_matches = list(
         re.finditer(
-            r"\b(FS|SS|RA)\b\s+"
+            r"\b(FS|SS|RA|AS)\b\s+"
             r"(\$?[\d.,]+|---)"
             r"(?:\s+(\$?[\d.,]+|---))?"
             r"(?:\s+(\$?[\d.,]+|---))?"
@@ -226,11 +234,7 @@ def parse_prices_from_text(text: str) -> Dict[str, Optional[float]]:
             if idx >= len(parsed_values):
                 break
             value = parsed_values[idx]
-            suffix = {
-                "FS": "FULL",
-                "SS": "SELF",
-                "RA": "RA",
-            }[service]
+            suffix = SERVICE_MAP[service]
             key = f"{fuel}_{suffix}"
             if key in prices:
                 prices[key] = value
@@ -263,12 +267,15 @@ def parse_provider_rows(
         if "Alternatives at nearby airports" in row_text:
             break
 
+        upper_text = row_text.upper()
+
         if not any(
-            token in row_text.upper()
+            token in upper_text
             for token in ["100LL", "JET A", "JET-A", "MOGAS", "UL94", "UL91"]
         ):
             continue
-        if "FS" not in row_text and "SS" not in row_text and "RA" not in row_text:
+
+        if not re.search(r"\b(FS|SS|RA|AS)\b", row_text):
             continue
 
         fbo_name = extract_fbo_name_from_row(tr)
@@ -277,7 +284,7 @@ def parse_provider_rows(
         if fbo_name in seen_names:
             continue
 
-        guaranteed = "GUARANTEED" in row_text.upper()
+        guaranteed = "GUARANTEED" in upper_text
         last_update_date = parse_airnav_date(row_text)
         if last_update_date is None and guaranteed:
             last_update_date = today_str
