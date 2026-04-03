@@ -2,7 +2,7 @@ name: Fuel Collector Scheduler
 
 on:
   schedule:
-    - cron: "18,48 * * * *"
+    - cron: "*/18 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -27,4 +27,4 @@ jobs:
         env:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
         run: |
-          python scheduler.py 29
+          python scheduler.py 32
