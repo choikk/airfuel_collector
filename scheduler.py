@@ -12,11 +12,11 @@ from psycopg import connect
 
 DATABASE_URL = os.environ["NEON_DATABASE_URL"]
 BASE_DIR = Path(__file__).resolve().parent
-UPDATE_SCRIPT = str(BASE_DIR / "update_price_periods2.py")
+UPDATE_SCRIPT = str(BASE_DIR / "update_price_periods.py")
 
 # conservative defaults
 MAX_AIRPORTS_PER_RUN = 25
-MIN_DELAY_SECONDS = 12
+MIN_DELAY_SECONDS =  9
 MAX_DELAY_SECONDS = 18
 
 
@@ -43,11 +43,11 @@ def compute_next_check_at(
         elif airspace == "D":
             days = random.uniform(2.0, 4.0)
         elif airspace == "E":
-            days = random.uniform(4.0, 7.0)
+            days = random.uniform(2.0, 4.0)
         elif airspace == "G":
-            days = random.uniform(6.0, 10.0)
+            days = random.uniform(2.0, 4.0)
         else:
-            days = random.uniform(7.0, 10.0)
+            days = random.uniform(3.0, 7.0)
     else:
         if airspace == "B":
             days = random.uniform(2.0, 4.0)
@@ -56,11 +56,11 @@ def compute_next_check_at(
         elif airspace == "D":
             days = random.uniform(4.0, 7.0)
         elif airspace == "E":
-            days = random.uniform(7.0, 12.0)
+            days = random.uniform(4.0, 7.0)
         elif airspace == "G":
-            days = random.uniform(10.0, 16.0)
+            days = random.uniform(4.0, 7.0)
         else:
-            days = random.uniform(12.0, 18.0)
+            days = random.uniform(6.0, 10.0)
 
         if consecutive_no_change_count >= 10:
             days *= 1.5
@@ -86,10 +86,9 @@ def fetch_due_airports(cur, limit: int):
                 OR next_check_at <= NOW()
               )
         ORDER BY
-            CASE WHEN last_checked_at IS NULL THEN 0 ELSE 1 END,
+            last_checked_at ASC NULLS FIRST,
             COALESCE(check_priority, 2) ASC,
             CASE WHEN last_checked_at IS NULL THEN random() ELSE 0 END,
-            next_check_at ASC NULLS FIRST,
             airport_code ASC
         LIMIT %s
         """,
@@ -217,7 +216,6 @@ def main():
     unchanged_count = 0
 
     with connect(DATABASE_URL) as conn:
-        due_airports = []
         with conn.cursor() as cur:
             due_airports = fetch_due_airports(cur, run_limit)
 

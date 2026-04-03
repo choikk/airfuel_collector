@@ -12,7 +12,7 @@ from psycopg import connect
 
 DATABASE_URL = os.environ["NEON_DATABASE_URL"]
 BASE_DIR = Path(__file__).resolve().parent
-SCRAPER_PATH = str(BASE_DIR / "airnav_fuel_scraper2.py")
+SCRAPER_PATH = str(BASE_DIR / "airnav_fuel_scraper.py")
 
 
 def now_utc():
