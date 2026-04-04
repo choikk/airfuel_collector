@@ -5,35 +5,12 @@ airnav_fuel_scraper.py
 Usage:
     python airnav_fuel_scraper.py KGAI
 
-Output JSON example:
-{
-  "today_date": "2026-03-27",
-  "airport_code": "KGAI",
-  "source_url": "https://www.airnav.com/airport/KGAI",
-  "scraped_at": "2026-03-27T18:08:42+00:00",
-  "providers": [
-    {
-      "fbo_name": "DC Metro Aviation Services",
-      "last_update_date": "2026-03-27",
-      "guaranteed": true,
-      "prices": {
-        "100LL_FULL": "7.25",
-        "100LL_SELF": "6.70",
-        "JET_A_FULL": "7.23"
-      }
-    }
-  ]
-}
-
-Rules:
-- Parse only the "FBO, Fuel Providers, and Aircraft Ground Support" section
-- Stop when "Alternatives at nearby airports" appears
-- If last_update_date is missing and GUARANTEED is present, use today_date
-- Ignore nearby-airport alternatives entirely
-- Prices are always emitted as strings with 2 decimal places
-- If FBO name starts with "More info and photos of ", strip that prefix
-- In addition to 100LL and JET_A, also capture MOGAS, UL94, UL91 when present
-- Support FS, SS, RA, and AS (Assisted/Self Service)
+Strategy:
+- Primary source: AirNav
+- Fallback source: FltPlan airport page
+- AirNav values win when both sources provide the same key
+- FltPlan fills only missing price keys
+- If FltPlan contributes any actual missing values, source_url is switched to FltPlan
 """
 
 from __future__ import annotations
@@ -42,13 +19,14 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup, Tag
 
-BASE_URL = "https://www.airnav.com/airport/{code}"
-USER_AGENT = "Mozilla/5.0 (compatible; FuelPriceTracker/0.1)"
+AIRNAV_BASE_URL = "https://www.airnav.com/airport/{code}"
+FLTPLAN_BASE_URL = "https://www.fltplan.com/Airport.cgi?{code}"
+USER_AGENT = "Mozilla/5.0 (compatible; FuelPriceTracker/0.3)"
 TIMEOUT = 20
 
 SUPPORTED_FUELS = [
@@ -111,8 +89,17 @@ def parse_airnav_date(text: str) -> Optional[str]:
         return None
 
 
-def fetch_airport_page(airport_code: str) -> str:
-    url = BASE_URL.format(code=airport_code)
+def parse_fltplan_date(text: str) -> Optional[str]:
+    m = re.search(r"LAST\s+UPDATE:\s*(\d{2}/\d{2}/\d{4})", text, flags=re.I)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%m/%d/%Y").date().isoformat()
+    except ValueError:
+        return None
+
+
+def fetch_url(url: str) -> str:
     r = requests.get(
         url,
         headers={"User-Agent": USER_AGENT},
@@ -121,6 +108,10 @@ def fetch_airport_page(airport_code: str) -> str:
     r.raise_for_status()
     return r.text
 
+
+# ----------------------------
+# AirNav parser
+# ----------------------------
 
 def find_section_start(soup: BeautifulSoup) -> Optional[Tag]:
     for tag in soup.find_all(["h1", "h2", "h3", "h4", "b", "strong", "font"]):
@@ -169,10 +160,6 @@ def extract_fbo_name_from_row(tr: Tag) -> Optional[str]:
 
 
 def detect_header_fuels(text: str) -> List[str]:
-    """
-    Detect fuel columns in header order from the row text.
-    We only use supported fuels.
-    """
     tokens_in_order = []
     patterns = [
         ("100LL", r"\b100LL\b"),
@@ -250,7 +237,7 @@ def compact_formatted_prices(prices: Dict[str, Optional[float]]) -> Dict[str, Op
     return out
 
 
-def parse_provider_rows(
+def parse_airnav_provider_rows(
     soup: BeautifulSoup, section_start: Tag, section_end: Optional[Tag]
 ) -> List[Dict[str, Any]]:
     today_str = datetime.now(timezone.utc).date().isoformat()
@@ -307,27 +294,302 @@ def parse_provider_rows(
     return providers
 
 
-def scrape_airnav_prices(airport_code: str) -> Dict[str, Any]:
-    airport_code = normalize_airport_code(airport_code)
-    html = fetch_airport_page(airport_code)
+def scrape_airnav_prices(airport_code: str) -> List[Dict[str, Any]]:
+    html = fetch_url(AIRNAV_BASE_URL.format(code=airport_code))
     soup = BeautifulSoup(html, "lxml")
 
     section_start = find_section_start(soup)
-    providers: List[Dict[str, Any]] = []
+    if section_start is None:
+        return []
 
-    if section_start is not None:
-        section_end = find_section_end(section_start)
-        providers = parse_provider_rows(soup, section_start, section_end)
+    section_end = find_section_end(section_start)
+    return parse_airnav_provider_rows(soup, section_start, section_end)
+
+
+# ----------------------------
+# FltPlan parser
+# ----------------------------
+
+def fltplan_candidate_codes(airport_code: str) -> List[str]:
+    candidates = [airport_code]
+    if len(airport_code) == 4 and airport_code[0] in {"K", "C", "P"}:
+        candidates.append(airport_code[1:])
+    return list(dict.fromkeys(candidates))
+
+
+def normalize_fltplan_fuel(header: str) -> Optional[str]:
+    s = clean_text(header).upper()
+
+    if s == "100LL":
+        return "100LL"
+    if s in {"JET", "JET A", "JETA", "JET-A", "JETA+FSII", "JET A+FSII", "JET-A+FSII"}:
+        return "JET_A"
+    if s == "MOGAS":
+        return "MOGAS"
+    if s == "UL94":
+        return "UL94"
+    if s == "UL91":
+        return "UL91"
+
+    return None
+
+
+def normalize_fltplan_service(label: str) -> Optional[str]:
+    s = clean_text(label).upper()
+
+    if s.startswith("FULL"):
+        return "FULL"
+    if s.startswith("SELF"):
+        return "SELF"
+
+    return None
+
+
+def find_provider_name_above_header(rows: List[Tag], header_row_idx: int) -> Optional[str]:
+    """
+    Search upward from the fuel header row.
+    Accept only a row whose FIRST cell looks like the provider name
+    and whose row also contains provider-style info such as Ph: or Freq:.
+    """
+    for j in range(header_row_idx - 1, -1, -1):
+        cells = rows[j].find_all(["td", "th"])
+        if not cells:
+            continue
+
+        first = clean_text(cells[0].get_text(" ", strip=True))
+        if not first:
+            continue
+
+        row_texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
+        row_joined = " ".join(t for t in row_texts if t)
+        upper_first = first.upper()
+        upper_row = row_joined.upper()
+
+        # reject obvious non-provider rows
+        if upper_first in {"SERVICE", "JET", "100LL", "80/87", "MOGAS", "UL94", "UL91"}:
+            continue
+        if "FBO & FLIGHT SERVICES INFO FOR" in upper_first:
+            continue
+        if "AIRPORT & FBO INFO FOR" in upper_first:
+            continue
+        if "AIRPORT INFO FOR" in upper_first:
+            continue
+        if upper_first.startswith("LAST UPDATE"):
+            continue
+        if upper_first.startswith("ADDRESS:"):
+            continue
+        if upper_first.startswith("FREQ:"):
+            continue
+        if upper_first.startswith("PH:"):
+            continue
+        if "FBO REVIEWS" in upper_first:
+            continue
+
+        # accept only provider/info rows
+        if "PH:" in upper_row or "FREQ:" in upper_row:
+            return first
+
+    return None
+
+
+def parse_fltplan_table(soup: BeautifulSoup, airport_code: str) -> List[Dict[str, Any]]:
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    providers: List[Dict[str, Any]] = []
+    seen_provider_names = set()
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 3:
+            continue
+
+        header_row_idx = None
+        header_cells_text = None
+
+        # Find fuel header row
+        for i, row in enumerate(rows):
+            cells = row.find_all(["td", "th"])
+            texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
+            upper = [t.upper() for t in texts]
+
+            if not texts:
+                continue
+
+            if len(upper) >= 2 and upper[0] == "SERVICE":
+                if any(h in upper for h in ["JET", "JET A", "JETA", "JET-A", "100LL", "MOGAS", "UL94", "UL91"]):
+                    header_row_idx = i
+                    header_cells_text = texts
+                    break
+
+        if header_row_idx is None or header_cells_text is None:
+            continue
+
+        provider_name = find_provider_name_above_header(rows, header_row_idx)
+        if not provider_name:
+            continue
+
+        fuel_columns: Dict[int, str] = {}
+        for idx, header_text in enumerate(header_cells_text[1:], start=1):
+            fuel_name = normalize_fltplan_fuel(header_text)
+            if fuel_name:
+                fuel_columns[idx] = fuel_name
+
+        if not fuel_columns:
+            continue
+
+        prices: Dict[str, str] = {}
+        table_text = clean_text(table.get_text(" ", strip=True))
+        last_update_date = parse_fltplan_date(table_text) or today_str
+
+        # Parse only service rows below the header
+        for row in rows[header_row_idx + 1:]:
+            cells = row.find_all(["td", "th"])
+            if not cells:
+                continue
+
+            texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
+            if not texts:
+                continue
+
+            service_type = normalize_fltplan_service(texts[0])
+            if not service_type:
+                if prices:
+                    break
+                continue
+
+            for idx, fuel_name in fuel_columns.items():
+                if idx >= len(texts):
+                    continue
+
+                cell_text = texts[idx]
+                price = parse_price(cell_text)
+                if price is None:
+                    continue
+
+                prices[f"{fuel_name}_{service_type}"] = format_price(price)
+
+        if not prices:
+            continue
+
+        if provider_name in seen_provider_names:
+            continue
+
+        providers.append(
+            {
+                "fbo_name": provider_name,
+                "last_update_date": last_update_date,
+                "guaranteed": False,
+                "prices": prices,
+            }
+        )
+        seen_provider_names.add(provider_name)
+
+    return providers
+
+
+def scrape_fltplan_prices(airport_code: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    for candidate in fltplan_candidate_codes(airport_code):
+        url = FLTPLAN_BASE_URL.format(code=candidate)
+
+        try:
+            html = fetch_url(url)
+        except requests.HTTPError:
+            continue
+
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text("\n", strip=True).upper()
+
+        if "WAS NOT FOUND" in text or "ERROR MESSAGE" in text:
+            continue
+
+        providers = parse_fltplan_table(soup, airport_code)
+        if providers:
+            return providers, url
+
+    return [], None
+
+
+# ----------------------------
+# Merge + final output
+# ----------------------------
+
+def scrape_prices(airport_code: str) -> Dict[str, Any]:
+    airport_code = normalize_airport_code(airport_code)
+
+    airnav_providers: List[Dict[str, Any]] = []
+    fltplan_providers: List[Dict[str, Any]] = []
+
+    airnav_error = None
+    fltplan_error = None
+
+    source_url = AIRNAV_BASE_URL.format(code=airport_code)
+    fltplan_url = None
+
+    try:
+        airnav_providers = scrape_airnav_prices(airport_code)
+    except Exception as e:
+        airnav_error = str(e)
+
+    try:
+        fltplan_providers, fltplan_url = scrape_fltplan_prices(airport_code)
+    except Exception as e:
+        fltplan_error = str(e)
+
+    providers = airnav_providers
+
+    if providers:
+        if fltplan_providers:
+            fallback_prices: Dict[str, str] = {}
+            fallback_date = None
+
+            for provider in fltplan_providers:
+                for key, value in provider.get("prices", {}).items():
+                    fallback_prices.setdefault(key, value)
+                fallback_date = fallback_date or provider.get("last_update_date")
+
+            merged = []
+            used_fltplan = False
+
+            for provider in providers:
+                merged_prices = dict(provider.get("prices", {}))
+                for key, value in fallback_prices.items():
+                    if key not in merged_prices:
+                        merged_prices[key] = value
+                        used_fltplan = True
+
+                provider_out = dict(provider)
+                provider_out["prices"] = merged_prices
+
+                if fallback_date and not provider_out.get("last_update_date"):
+                    provider_out["last_update_date"] = fallback_date
+
+                merged.append(provider_out)
+
+            providers = merged
+
+            if used_fltplan and fltplan_url:
+                source_url = fltplan_url
+    else:
+        if fltplan_providers:
+            providers = fltplan_providers
+            if fltplan_url:
+                source_url = fltplan_url
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
 
-    return {
+    out = {
         "today_date": now.date().isoformat(),
         "airport_code": airport_code,
-        "source_url": BASE_URL.format(code=airport_code),
+        "source_url": source_url,
         "scraped_at": now.isoformat(),
         "providers": providers,
     }
+
+    if airnav_error:
+        out["airnav_error"] = airnav_error
+    if fltplan_error:
+        out["fltplan_error"] = fltplan_error
+
+    return out
 
 
 def main() -> int:
@@ -338,7 +600,7 @@ def main() -> int:
     airport_code = sys.argv[1]
 
     try:
-        result = scrape_airnav_prices(airport_code)
+        result = scrape_prices(airport_code)
     except requests.HTTPError as e:
         print(
             json.dumps(

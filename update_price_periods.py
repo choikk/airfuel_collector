@@ -178,6 +178,17 @@ def normalize_scraped_prices(scraped: dict):
     return out
 
 
+def bump_check_priority_only(cur, airport_code: str):
+    cur.execute(
+        """
+        UPDATE airports
+        SET check_priority = COALESCE(check_priority, 2) + 1
+        WHERE airport_code = %s
+        """,
+        (airport_code,),
+    )
+
+
 def process_airport(airport_code: str):
     scraped = run_scraper(airport_code)
     ts = now_utc()
@@ -187,6 +198,12 @@ def process_airport(airport_code: str):
     with connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             existing_open_rows = get_open_rows_for_airport(cur, airport_code)
+
+            # 0. If both AirNav and FltPlan returned no prices, only bump check_priority
+            if not scraped_prices:
+                bump_check_priority_only(cur, airport_code)
+                conn.commit()
+                return scraped
 
             # 1. If airport not in DB at all, write all scraped prices
             if not existing_open_rows:
