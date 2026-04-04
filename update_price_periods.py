@@ -182,7 +182,8 @@ def bump_check_priority_only(cur, airport_code: str):
     cur.execute(
         """
         UPDATE airports
-        SET check_priority = COALESCE(check_priority, 2) + 1
+#        SET check_priority = COALESCE(check_priority, 2) + 1
+        SET check_priority = LEAST(COALESCE(check_priority, 2) + 1, 5)
         WHERE airport_code = %s
         """,
         (airport_code,),
