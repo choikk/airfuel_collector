@@ -2,11 +2,19 @@
 """
 airnav_fuel_scraper.py
 
-- AirNav 우선
-- AirNav structured parser 우선
-- KPYG / KEDU 같은 flat-text AirNav layout 은 text-block fallback 사용
-- FltPlan은 AirNav가 완전히 비었을 때만 fallback
-- KPYG 전용 regex fallback 추가
+Tested against uploaded AirNav HTML files for:
+- KPYG
+- KLXV
+- KGAI
+- KIAD
+
+Behavior:
+- AirNav first
+- Robust row-based AirNav parser
+- Handles plain-text business names (KPYG, KLXV)
+- Handles image-alt business names (KIAD)
+- Stops before "Alternatives at nearby airports"
+- Falls back to FltPlan only if AirNav yields no providers
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -22,7 +31,7 @@ from bs4 import BeautifulSoup, Tag
 
 AIRNAV_BASE_URL = "https://www.airnav.com/airport/{code}"
 FLTPLAN_BASE_URL = "https://www.fltplan.com/Airport.cgi?{code}"
-USER_AGENT = "Mozilla/5.0 (FuelTracker/11.0)"
+USER_AGENT = "Mozilla/5.0 (FuelTracker/13.0)"
 TIMEOUT = 20
 
 SERVICE_MAP = {
@@ -31,27 +40,6 @@ SERVICE_MAP = {
     "RA": "RA",
     "AS": "SELF",
 }
-
-TEXT_FUEL_KEY_MAP = {
-    ("100LL", "FS"): "100LL_FULL",
-    ("100LL", "SS"): "100LL_SELF",
-    ("100LL", "RA"): "100LL_RA",
-    ("100LL", "AS"): "100LL_SELF",
-    ("JET_A", "FS"): "JET_A_FULL",
-    ("JET_A", "SS"): "JET_A_SELF",
-    ("JET_A", "RA"): "JET_A_RA",
-    ("JET_A", "AS"): "JET_A_SELF",
-    ("SAF", "FS"): "SAF_FULL",
-    ("SAF", "SS"): "SAF_SELF",
-    ("SAF", "RA"): "SAF_RA",
-    ("SAF", "AS"): "SAF_SELF",
-}
-
-FUEL_TOKENS = ["100LL", "JET A", "JET-A", "JETA", "SAF"]
-
-PHONE_PAT = re.compile(
-    r"(?:\+?1[\s\.-]?)?(?:\(?\d{3}\)?[\s\.-]?\d{3}[\s\.-]?\d{4})"
-)
 
 
 def clean_text(text: str) -> str:
@@ -68,7 +56,8 @@ def normalize_airport_code(code: str) -> str:
 def normalize_fbo_name(name: str) -> str:
     name = clean_text(name)
     name = re.sub(r"^More info(?: and photos)? of\s+", "", name, flags=re.I)
-    return clean_text(name)
+    name = re.sub(r"\s+", " ", name).strip(" ,")
+    return name
 
 
 def fetch_url(url: str) -> str:
@@ -95,20 +84,8 @@ def format_price(value: Optional[float]) -> Optional[str]:
     return None if value is None else f"{value:.2f}"
 
 
-def normalize_split_airnav_dates(text: str) -> str:
-    text = text or ""
-    text = re.sub(
-        r"(\d{1,2})-\s*([A-Za-z]{3})-\s*(\d{4})",
-        r"\1-\2-\3",
-        text,
-        flags=re.I,
-    )
-    return text
-
-
 def parse_airnav_date(text: str) -> Optional[str]:
-    text = normalize_split_airnav_dates(text)
-    m = re.search(r"\b(\d{1,2}-[A-Za-z]{3}-\d{4})\b", text)
+    m = re.search(r"\b(\d{1,2}-[A-Za-z]{3}-\d{4})\b", clean_text(text))
     if not m:
         return None
     try:
@@ -128,29 +105,29 @@ def parse_fltplan_date(text: str) -> Optional[str]:
 
 
 # ----------------------------
-# AirNav structured parser
+# AirNav parser
 # ----------------------------
 
-def find_airnav_section_container(soup: BeautifulSoup) -> Optional[Tag]:
-    for h3 in soup.find_all("h3"):
-        if clean_text(h3.get_text(" ", strip=True)) == "FBO, Fuel Providers, and Aircraft Ground Support":
-            tr = h3.find_parent("tr")
-            if tr is None:
-                continue
-            tbody = tr.find_parent("tbody")
-            if tbody is not None:
-                return tbody
-            table = tr.find_parent("table")
-            if table is not None:
-                return table
+def find_airnav_section_table(soup: BeautifulSoup) -> Optional[Tag]:
+    anchor = soup.find("a", attrs={"name": "biz"})
+    if anchor is not None:
+        table = anchor.find_next("table")
+        if table and table.find("h3", string=lambda s: s and "FBO, Fuel Providers, and Aircraft Ground Support" in s):
+            return table
+
+    h3 = soup.find("h3", string=lambda s: s and "FBO, Fuel Providers, and Aircraft Ground Support" in s)
+    if h3 is not None:
+        return h3.find_parent("table")
+
     return None
 
 
-def extract_provider_rows(section: Tag, airport_code: str) -> List[Tag]:
-    airport_code = airport_code.upper()
-    rows: List[Tag] = []
+def get_airnav_section_rows(section_table: Tag) -> List[Tag]:
+    tbody = section_table.find("tbody") or section_table
+    rows = tbody.find_all("tr", recursive=False)
 
-    for row in section.find_all("tr"):
+    out: List[Tag] = []
+    for row in rows:
         row_text = clean_text(row.get_text(" ", strip=True))
 
         if "Alternatives at nearby airports" in row_text:
@@ -160,125 +137,120 @@ def extract_provider_rows(section: Tag, airport_code: str) -> List[Tag]:
         if "Aviation Businesses, Services, and Facilities" in row_text:
             break
 
-        for a in row.find_all("a", href=True):
-            href = (a.get("href") or "").upper()
-            if f"/AIRPORT/{airport_code}/" in href:
-                rows.append(row)
-                break
+        out.append(row)
 
-    return rows
+    return out
 
 
-def extract_fbo_name(row: Tag, airport_code: str) -> Optional[str]:
+def extract_airnav_fbo_name(biz_td: Tag, airport_code: str) -> Optional[str]:
     airport_code = airport_code.upper()
 
-    for a in row.find_all("a", href=True):
-        href = (a.get("href") or "").upper()
-        name = clean_text(a.get_text(" ", strip=True))
+    # 1) linked text
+    for a in biz_td.find_all("a", href=True):
+        href = a.get("href") or ""
+        text = clean_text(a.get_text(" ", strip=True))
+        if (
+            f"/airport/{airport_code}/".lower() in href.lower()
+            and text
+            and text.lower() not in {"read", "write", "web site", "email"}
+        ):
+            return normalize_fbo_name(text)
 
-        if not name:
-            continue
-        if name.lower() in {"web site", "email", "write", "read", "download", "click here"}:
-            continue
-        if f"/AIRPORT/{airport_code}/" in href:
-            return normalize_fbo_name(name)
+    # 2) image alt inside airport link
+    for a in biz_td.find_all("a", href=True):
+        href = a.get("href") or ""
+        if f"/airport/{airport_code}/".lower() in href.lower():
+            img = a.find("img")
+            if img:
+                alt = clean_text(img.get("alt", ""))
+                if alt:
+                    return normalize_fbo_name(alt)
+
+    # 3) any image alt
+    for img in biz_td.find_all("img"):
+        alt = clean_text(img.get("alt", ""))
+        if alt:
+            return normalize_fbo_name(alt)
+
+    # 4) plain text cell
+    text = clean_text(biz_td.get_text(" ", strip=True))
+    if text:
+        return normalize_fbo_name(text)
 
     return None
 
 
-def find_fuel_table(row: Tag) -> Optional[Tag]:
-    candidates: List[Tuple[int, Tag]] = []
+def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, Optional[str]]:
+    fuel_table = fuel_td.find("table")
+    if fuel_table is None:
+        return {}, False, None
 
-    for table in row.find_all("table"):
-        txt = clean_text(table.get_text(" ", strip=True)).upper()
+    tbody = fuel_table.find("tbody") or fuel_table
+    rows = tbody.find_all("tr", recursive=False)
 
-        has_fuel = ("100LL" in txt) or ("JET A" in txt) or ("JET-A" in txt) or ("SAF" in txt)
-        has_service = bool(re.search(r"\b(FS|SS|RA|AS)\b", txt))
-        if not (has_fuel and has_service):
+    fuel_order: List[str] = []
+    prices_raw: Dict[str, float] = {}
+    guaranteed = False
+    last_update_date: Optional[str] = None
+
+    for row in rows:
+        row_text = clean_text(row.get_text(" ", strip=True))
+        if not row_text:
             continue
 
-        score = 0
-        if "100LL" in txt:
-            score += 1
-        if "JET A" in txt or "JET-A" in txt:
-            score += 1
-        if "SAF" in txt:
-            score += 1
-        if re.search(r"\bFS\b", txt):
-            score += 1
-        if re.search(r"\bSS\b", txt):
-            score += 1
-        if "GUARANTEED" in txt:
-            score += 1
+        if "GUARANTEED" in row_text.upper():
+            guaranteed = True
+            continue
 
-        candidates.append((score, table))
+        dt = parse_airnav_date(row_text)
+        if dt:
+            last_update_date = dt
 
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
-
-
-def extract_fuel_order(table: Tag) -> List[str]:
-    for row in table.find_all("tr"):
-        cells = row.find_all("td")
+        cells = row.find_all("td", recursive=False)
         if not cells:
             continue
 
-        texts = [clean_text(c.get_text(" ", strip=True)).upper() for c in cells]
-        joined = " | ".join(texts)
+        # Service row
+        m = re.match(r"^(FS|SS|RA|AS)\b", row_text)
+        if m:
+            svc_code = m.group(1).upper()
+            if svc_code not in SERVICE_MAP:
+                continue
 
-        has_fuel = ("100LL" in joined) or ("JET A" in joined) or ("JET-A" in joined) or ("SAF" in joined)
-        has_service = bool(re.search(r"\b(FS|SS|RA|AS)\b", joined))
-        if not has_fuel or has_service:
+            # Prefer individual TD parsing to avoid alignment issues
+            values: List[str] = []
+            for td in cells[1:]:
+                td_text = clean_text(td.get_text(" ", strip=True))
+                mm = re.search(r"(\d+\.\d+|---)", td_text)
+                if mm:
+                    values.append(mm.group(1))
+
+            if not values:
+                values = re.findall(r"\$?\d+\.\d+|---", row_text)
+
+            for fuel, raw_val in zip(fuel_order, values):
+                value = parse_price(raw_val)
+                if value is None:
+                    continue
+                suffix = SERVICE_MAP[svc_code]
+                prices_raw[f"{fuel}_{suffix}"] = value
+
             continue
 
+        # Header row
         order: List[str] = []
-        for txt in texts:
+        for td in cells:
+            txt = clean_text(td.get_text(" ", strip=True)).upper()
             if "100LL" in txt and "100LL" not in order:
                 order.append("100LL")
             elif ("JET A" in txt or "JET-A" in txt or txt == "JETA") and "JET_A" not in order:
                 order.append("JET_A")
             elif "SAF" in txt and "SAF" not in order:
                 order.append("SAF")
+
         if order:
-            return order
+            fuel_order = order
 
-    return []
-
-
-def parse_service_rows(table: Tag, fuel_order: List[str]) -> Dict[str, float]:
-    prices: Dict[str, float] = {}
-
-    for row in table.find_all("tr"):
-        row_text = clean_text(row.get_text(" ", strip=True))
-        m = re.match(r"^(FS|SS|RA|AS)\b", row_text)
-        if not m:
-            continue
-
-        svc_code = m.group(1).upper()
-        if svc_code not in SERVICE_MAP:
-            continue
-        service = SERVICE_MAP[svc_code]
-
-        nums = re.findall(r"\$?\d+\.\d+", row_text)
-        if not nums:
-            continue
-
-        for idx, num in enumerate(nums):
-            if idx >= len(fuel_order):
-                break
-            fuel = fuel_order[idx]
-            value = parse_price(num)
-            if value is None:
-                continue
-            prices[f"{fuel}_{service}"] = value
-
-    return prices
-
-
-def apply_price_sanity(prices_raw: Dict[str, float]) -> Dict[str, str]:
     cleaned: Dict[str, str] = {}
 
     for fuel in ("100LL", "JET_A"):
@@ -297,326 +269,61 @@ def apply_price_sanity(prices_raw: Dict[str, float]) -> Dict[str, str]:
         if self_val is not None:
             cleaned[self_key] = format_price(self_val)
 
+        ra_key = f"{fuel}_RA"
+        if ra_key in prices_raw:
+            cleaned[ra_key] = format_price(prices_raw[ra_key])
+
     for key, value in prices_raw.items():
-        if key.startswith("SAF_") and value is not None:
+        if key.startswith("SAF_"):
             cleaned[key] = format_price(value)
 
-    return cleaned
+    return cleaned, guaranteed, last_update_date
 
 
-def parse_fuel_table(table: Tag) -> Dict[str, str]:
-    fuel_order = extract_fuel_order(table)
-    if not fuel_order:
-        return {}
-
-    raw_prices = parse_service_rows(table, fuel_order)
-    if not raw_prices:
-        return {}
-
-    return apply_price_sanity(raw_prices)
-
-
-def scrape_airnav_prices_structured(airport_code: str, soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    section = find_airnav_section_container(soup)
-    if section is None:
+def scrape_airnav_prices_from_html(html: str, airport_code: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "lxml")
+    section_table = find_airnav_section_table(soup)
+    if section_table is None:
         return []
 
     providers: List[Dict[str, Any]] = []
     seen_names = set()
 
-    for row in extract_provider_rows(section, airport_code):
-        fbo_name = extract_fbo_name(row, airport_code)
+    for row in get_airnav_section_rows(section_table):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) < 7:
+            continue
+
+        biz_td = cells[0]
+        fuel_td = cells[6]
+
+        if fuel_td.find("table") is None:
+            continue
+
+        fbo_name = extract_airnav_fbo_name(biz_td, airport_code)
         if not fbo_name or fbo_name in seen_names:
             continue
 
-        fuel_table = find_fuel_table(row)
-        if fuel_table is None:
-            continue
-
-        prices = parse_fuel_table(fuel_table)
-        if not prices:
-            continue
-
-        row_text = clean_text(row.get_text(" ", strip=True))
-        providers.append(
-            {
-                "fbo_name": fbo_name,
-                "last_update_date": parse_airnav_date(row_text),
-                "guaranteed": "GUARANTEED" in row_text.upper(),
-                "prices": prices,
-            }
-        )
-        seen_names.add(fbo_name)
-
-    return providers
-
-
-# ----------------------------
-# AirNav text-block fallback
-# ----------------------------
-
-def trim_to_fuel_header(line: str) -> str:
-    up = line.upper()
-
-    candidates = []
-    for token in FUEL_TOKENS:
-        idx = up.find(token)
-        if idx != -1:
-            candidates.append(idx)
-
-    if not candidates:
-        return line.strip()
-
-    start = min(candidates)
-    return line[start:].strip()
-
-
-def contains_fuel_header(line: str) -> bool:
-    up = line.upper()
-    return any(token in up for token in FUEL_TOKENS)
-
-
-def extract_inline_fuel_order(line: str) -> List[str]:
-    line = trim_to_fuel_header(line)
-    up = line.upper()
-
-    order: List[str] = []
-
-    if "100LL" in up:
-        order.append("100LL")
-    if ("JET A" in up) or ("JET-A" in up) or ("JETA" in up):
-        order.append("JET_A")
-    if "SAF" in up:
-        order.append("SAF")
-
-    return order
-
-
-def is_probable_provider_start(line: str) -> bool:
-    up = line.upper()
-
-    if not line:
-        return False
-    if line in {"Business Name", "Contact", "Services / Description", "Fuel Prices", "Comments"}:
-        return False
-    if up.startswith("UPDATED "):
-        return False
-    if re.match(r"^(FS|SS|RA|AS)\b", up):
-        return False
-    if line.lower() in {"no information available", "write", "read", "web site", "email"}:
-        return False
-    if line.startswith("If you are affiliated with "):
-        return False
-    if line.startswith("Located at "):
-        return False
-    if line.startswith("SS=") or line.startswith("FS="):
-        return False
-    if "Would you like to see your business listed on this page?" in line:
-        return False
-    if contains_fuel_header(line):
-        return False
-    return True
-
-
-def extract_provider_blocks_from_section(section: Tag) -> List[str]:
-    text = section.get_text("\n", strip=True)
-    text = normalize_split_airnav_dates(text)
-
-    lines = [clean_text(x) for x in text.splitlines()]
-    lines = [x for x in lines if x]
-
-    start_idx = 0
-    for i, line in enumerate(lines):
-        if line == "Business Name":
-            start_idx = i + 1
-            break
-
-    lines = lines[start_idx:]
-
-    stop_markers = (
-        "Would you like to see your business listed on this page?",
-        "Other Pages about",
-        "Alternatives at nearby airports",
-        "Aviation Businesses, Services, and Facilities",
-    )
-
-    trimmed: List[str] = []
-    for line in lines:
-        if any(marker in line for marker in stop_markers):
-            break
-        trimmed.append(line)
-
-    blocks: List[List[str]] = []
-    cur: List[str] = []
-
-    for line in trimmed:
-        if is_probable_provider_start(line):
-            if cur:
-                blocks.append(cur)
-            cur = [line]
-        else:
-            if cur:
-                cur.append(line)
-
-    if cur:
-        blocks.append(cur)
-
-    return ["\n".join(block) for block in blocks if block]
-
-
-def extract_fbo_name_from_block(block_text: str) -> Optional[str]:
-    lines = [clean_text(x) for x in block_text.splitlines() if clean_text(x)]
-    if not lines:
-        return None
-
-    first = lines[0]
-    first = PHONE_PAT.sub("", first).strip()
-
-    if not first or first.lower() == "no information available":
-        m = re.search(
-            r"If you are affiliated with (.+?) and would like to show here",
-            block_text,
-            flags=re.I,
-        )
-        if m:
-            first = clean_text(m.group(1))
-
-    return normalize_fbo_name(first) if first else None
-
-
-def parse_airnav_text_prices(block_text: str) -> Dict[str, str]:
-    block_text = normalize_split_airnav_dates(block_text)
-
-    lines = [clean_text(x) for x in block_text.splitlines() if clean_text(x)]
-    prices_raw: Dict[str, float] = {}
-    fuel_order: List[str] = []
-
-    for line in lines:
-        line = trim_to_fuel_header(line)
-        up = line.upper()
-
-        if contains_fuel_header(up):
-            inline_order = extract_inline_fuel_order(up)
-            if inline_order:
-                fuel_order = inline_order
-            continue
-
-        m = re.match(r"^(FS|SS|RA|AS)\b", up)
-        if m and fuel_order:
-            svc_code = m.group(1).upper()
-            nums = re.findall(r"\$?\d+\.\d+", line)
-
-            for idx, num in enumerate(nums):
-                if idx >= len(fuel_order):
-                    break
-                fuel = fuel_order[idx]
-                key = TEXT_FUEL_KEY_MAP.get((fuel, svc_code))
-                if not key:
-                    continue
-                value = parse_price(num)
-                if value is not None:
-                    prices_raw[key] = value
-
-    if not prices_raw:
-        return {}
-
-    return apply_price_sanity(prices_raw)
-
-
-def scrape_airnav_prices_text_fallback(airport_code: str, soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    section = find_airnav_section_container(soup)
-    if section is None:
-        return []
-
-    providers: List[Dict[str, Any]] = []
-    seen_names = set()
-
-    for block_text in extract_provider_blocks_from_section(section):
-        block_text = normalize_split_airnav_dates(block_text)
-
-        fbo_name = extract_fbo_name_from_block(block_text)
-        if not fbo_name or fbo_name in seen_names:
-            continue
-
-        prices = parse_airnav_text_prices(block_text)
+        prices, guaranteed, last_update_date = extract_airnav_fuel_table_data(fuel_td)
         if not prices:
             continue
 
         providers.append(
             {
                 "fbo_name": fbo_name,
-                "last_update_date": parse_airnav_date(block_text),
-                "guaranteed": "GUARANTEED" in block_text.upper(),
+                "last_update_date": last_update_date,
+                "guaranteed": guaranteed,
                 "prices": prices,
             }
         )
         seen_names.add(fbo_name)
 
     return providers
-
-
-# ----------------------------
-# KPYG exact regex fallback
-# ----------------------------
-
-def scrape_airnav_prices_kpyg_regex_fallback(airport_code: str, soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    if airport_code.upper() != "KPYG":
-        return []
-
-    section = find_airnav_section_container(soup)
-    if section is None:
-        return []
-
-    text = normalize_split_airnav_dates(section.get_text("\n", strip=True))
-
-    m_name = re.search(
-        r"Town of Pageland \(self-serve fuel\)\s+(?:\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})?",
-        text,
-        flags=re.I,
-    )
-    m_price = re.search(r"\bSS\s*\$([0-9]+(?:\.[0-9]+)?)\b", text, flags=re.I)
-    m_date = re.search(r"\bUpdated\s+(\d{1,2}-[A-Za-z]{3}-\d{4})\b", text, flags=re.I)
-
-    if not (m_name and m_price):
-        return []
-
-    fbo_name = "Town of Pageland (self-serve fuel)"
-    last_update_date = None
-    if m_date:
-        try:
-            last_update_date = datetime.strptime(m_date.group(1), "%d-%b-%Y").date().isoformat()
-        except ValueError:
-            last_update_date = None
-
-    return [
-        {
-            "fbo_name": fbo_name,
-            "last_update_date": last_update_date,
-            "guaranteed": False,
-            "prices": {
-                "100LL_SELF": format_price(parse_price(m_price.group(1))),
-            },
-        }
-    ]
 
 
 def scrape_airnav_prices(airport_code: str) -> List[Dict[str, Any]]:
     html = fetch_url(AIRNAV_BASE_URL.format(code=airport_code))
-    soup = BeautifulSoup(html, "lxml")
-
-    providers = scrape_airnav_prices_structured(airport_code, soup)
-    if providers:
-        return providers
-
-    providers = scrape_airnav_prices_text_fallback(airport_code, soup)
-    if providers:
-        return providers
-
-    providers = scrape_airnav_prices_kpyg_regex_fallback(airport_code, soup)
-    if providers:
-        return providers
-
-    return []
+    return scrape_airnav_prices_from_html(html, airport_code)
 
 
 # ----------------------------
@@ -797,7 +504,7 @@ def scrape_fltplan_prices(airport_code: str) -> Tuple[List[Dict[str, Any]], Opti
 
 
 # ----------------------------
-# Final merge/output
+# Final output
 # ----------------------------
 
 def scrape_prices(airport_code: str) -> Dict[str, Any]:
@@ -846,10 +553,57 @@ def scrape_prices(airport_code: str) -> Dict[str, Any]:
     return out
 
 
+# ----------------------------
+# Optional local file test mode
+# ----------------------------
+
+def scrape_prices_from_local_airnav_html(html_path: str, airport_code: str) -> Dict[str, Any]:
+    airport_code = normalize_airport_code(airport_code)
+    html = Path(html_path).read_text(errors="ignore")
+
+    providers = scrape_airnav_prices_from_html(html, airport_code)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    return {
+        "today_date": now.date().isoformat(),
+        "airport_code": airport_code,
+        "source_url": AIRNAV_BASE_URL.format(code=airport_code),
+        "scraped_at": now.isoformat(),
+        "providers": providers,
+    }
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: python airnav_fuel_scraper.py <AIRPORT_CODE>", file=sys.stderr)
+    if len(sys.argv) not in {2, 4}:
+        print(
+            "Usage:\n"
+            "  python airnav_fuel_scraper.py <AIRPORT_CODE>\n"
+            "  python airnav_fuel_scraper.py --test-html <AIRPORT_CODE> <HTML_PATH>",
+            file=sys.stderr,
+        )
         return 2
+
+    if len(sys.argv) == 4 and sys.argv[1] == "--test-html":
+        airport_code = sys.argv[2]
+        html_path = sys.argv[3]
+        try:
+            result = scrape_prices_from_local_airnav_html(html_path, airport_code)
+        except Exception as e:
+            print(
+                json.dumps(
+                    {
+                        "error": "local_html_parse_error",
+                        "airport_code": clean_text(airport_code).upper(),
+                        "message": str(e),
+                    },
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 1
+
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
 
     airport_code = sys.argv[1]
 
