@@ -3,6 +3,7 @@
 airnav_fuel_scraper.py
 
 Tested against uploaded AirNav HTML files for:
+- KLXL
 - KPYG
 - KLXV
 - KGAI
@@ -11,8 +12,9 @@ Tested against uploaded AirNav HTML files for:
 Behavior:
 - AirNav first
 - Robust row-based AirNav parser
-- Handles plain-text business names (KPYG, KLXV)
+- Handles plain-text business names (KPYG, KLXV, KLXL)
 - Handles image-alt business names (KIAD)
+- Supports 100LL / MOGAS / UL91 / JET A / SAF
 - Stops before "Alternatives at nearby airports"
 - Falls back to FltPlan only if AirNav yields no providers
 """
@@ -31,7 +33,7 @@ from bs4 import BeautifulSoup, Tag
 
 AIRNAV_BASE_URL = "https://www.airnav.com/airport/{code}"
 FLTPLAN_BASE_URL = "https://www.fltplan.com/Airport.cgi?{code}"
-USER_AGENT = "Mozilla/5.0 (FuelTracker/13.0)"
+USER_AGENT = "Mozilla/5.0 (FuelTracker/14.0)"
 TIMEOUT = 20
 
 SERVICE_MAP = {
@@ -40,6 +42,8 @@ SERVICE_MAP = {
     "RA": "RA",
     "AS": "SELF",
 }
+
+SUPPORTED_FUELS = ("100LL", "MOGAS", "UL91", "JET_A", "SAF")
 
 
 def clean_text(text: str) -> str:
@@ -107,6 +111,21 @@ def parse_fltplan_date(text: str) -> Optional[str]:
 # ----------------------------
 # AirNav parser
 # ----------------------------
+
+def canonical_airnav_fuel(token: str) -> Optional[str]:
+    t = clean_text(token).upper()
+    if t == "100LL":
+        return "100LL"
+    if t == "MOGAS":
+        return "MOGAS"
+    if t == "UL91":
+        return "UL91"
+    if t in {"JET A", "JET-A", "JETA"}:
+        return "JET_A"
+    if t == "SAF":
+        return "SAF"
+    return None
+
 
 def find_airnav_section_table(soup: BeautifulSoup) -> Optional[Tag]:
     anchor = soup.find("a", attrs={"name": "biz"})
@@ -217,7 +236,6 @@ def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, 
             if svc_code not in SERVICE_MAP:
                 continue
 
-            # Prefer individual TD parsing to avoid alignment issues
             values: List[str] = []
             for td in cells[1:]:
                 td_text = clean_text(td.get_text(" ", strip=True))
@@ -241,25 +259,27 @@ def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, 
         order: List[str] = []
         for td in cells:
             txt = clean_text(td.get_text(" ", strip=True)).upper()
-            if "100LL" in txt and "100LL" not in order:
-                order.append("100LL")
-            elif ("JET A" in txt or "JET-A" in txt or txt == "JETA") and "JET_A" not in order:
-                order.append("JET_A")
-            elif "SAF" in txt and "SAF" not in order:
-                order.append("SAF")
+
+            for token in ("100LL", "MOGAS", "UL91", "JET A", "JET-A", "JETA", "SAF"):
+                if token in txt:
+                    fuel = canonical_airnav_fuel(token)
+                    if fuel and fuel not in order:
+                        order.append(fuel)
 
         if order:
             fuel_order = order
 
     cleaned: Dict[str, str] = {}
 
-    for fuel in ("100LL", "JET_A"):
+    for fuel in SUPPORTED_FUELS:
         full_key = f"{fuel}_FULL"
         self_key = f"{fuel}_SELF"
+        ra_key = f"{fuel}_RA"
 
         full_val = prices_raw.get(full_key)
         self_val = prices_raw.get(self_key)
 
+        # sanity check only where both full/self exist
         if full_val is not None and self_val is not None and self_val > full_val:
             full_val = None
             self_val = None
@@ -268,14 +288,8 @@ def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, 
             cleaned[full_key] = format_price(full_val)
         if self_val is not None:
             cleaned[self_key] = format_price(self_val)
-
-        ra_key = f"{fuel}_RA"
         if ra_key in prices_raw:
             cleaned[ra_key] = format_price(prices_raw[ra_key])
-
-    for key, value in prices_raw.items():
-        if key.startswith("SAF_"):
-            cleaned[key] = format_price(value)
 
     return cleaned, guaranteed, last_update_date
 
@@ -354,8 +368,14 @@ def normalize_fltplan_fuel(header: str) -> Optional[str]:
     s = clean_text(header).upper()
     if s == "100LL":
         return "100LL"
+    if s == "MOGAS":
+        return "MOGAS"
+    if s == "UL91":
+        return "UL91"
     if s in {"JET", "JET A", "JETA", "JET-A", "JETA+FSII", "JET A+FSII", "JET-A+FSII"}:
         return "JET_A"
+    if s == "SAF":
+        return "SAF"
     return None
 
 
@@ -413,7 +433,7 @@ def parse_fltplan_table(soup: BeautifulSoup, airport_code: str) -> List[Dict[str
                 continue
 
             if len(upper) >= 2 and upper[0] == "SERVICE":
-                if any(h in upper for h in ["JET", "JET A", "JETA", "JET-A", "100LL"]):
+                if any(h in upper for h in ["JET", "JET A", "JETA", "JET-A", "100LL", "MOGAS", "UL91", "SAF"]):
                     header_row_idx = i
                     header_cells_text = texts
                     break
