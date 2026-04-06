@@ -3,6 +3,7 @@
 airnav_fuel_scraper.py
 
 Tested against uploaded AirNav HTML files for:
+- KMNM
 - KLXL
 - KPYG
 - KLXV
@@ -12,9 +13,10 @@ Tested against uploaded AirNav HTML files for:
 Behavior:
 - AirNav first
 - Robust row-based AirNav parser
-- Handles plain-text business names (KPYG, KLXV, KLXL)
+- Handles plain-text business names (KPYG, KLXV, KLXL, KMNM)
 - Handles image-alt business names (KIAD)
 - Supports 100LL / MOGAS / UL91 / JET A / SAF
+- Treats PS (pump service) as FULL
 - Stops before "Alternatives at nearby airports"
 - Falls back to FltPlan only if AirNav yields no providers
 """
@@ -33,7 +35,7 @@ from bs4 import BeautifulSoup, Tag
 
 AIRNAV_BASE_URL = "https://www.airnav.com/airport/{code}"
 FLTPLAN_BASE_URL = "https://www.fltplan.com/Airport.cgi?{code}"
-USER_AGENT = "Mozilla/5.0 (FuelTracker/14.0)"
+USER_AGENT = "Mozilla/5.0 (FuelTracker/15.0)"
 TIMEOUT = 20
 
 SERVICE_MAP = {
@@ -41,6 +43,7 @@ SERVICE_MAP = {
     "SS": "SELF",
     "RA": "RA",
     "AS": "SELF",
+    "PS": "FULL",
 }
 
 SUPPORTED_FUELS = ("100LL", "MOGAS", "UL91", "JET_A", "SAF")
@@ -120,7 +123,7 @@ def canonical_airnav_fuel(token: str) -> Optional[str]:
         return "MOGAS"
     if t == "UL91":
         return "UL91"
-    if t in {"JET A", "JET-A", "JETA"}:
+    if t in {"JET A", "JET-A", "JETA", "JET A+", "JET-A+", "JETA+"}:
         return "JET_A"
     if t == "SAF":
         return "SAF"
@@ -164,7 +167,6 @@ def get_airnav_section_rows(section_table: Tag) -> List[Tag]:
 def extract_airnav_fbo_name(biz_td: Tag, airport_code: str) -> Optional[str]:
     airport_code = airport_code.upper()
 
-    # 1) linked text
     for a in biz_td.find_all("a", href=True):
         href = a.get("href") or ""
         text = clean_text(a.get_text(" ", strip=True))
@@ -175,7 +177,6 @@ def extract_airnav_fbo_name(biz_td: Tag, airport_code: str) -> Optional[str]:
         ):
             return normalize_fbo_name(text)
 
-    # 2) image alt inside airport link
     for a in biz_td.find_all("a", href=True):
         href = a.get("href") or ""
         if f"/airport/{airport_code}/".lower() in href.lower():
@@ -185,13 +186,11 @@ def extract_airnav_fbo_name(biz_td: Tag, airport_code: str) -> Optional[str]:
                 if alt:
                     return normalize_fbo_name(alt)
 
-    # 3) any image alt
     for img in biz_td.find_all("img"):
         alt = clean_text(img.get("alt", ""))
         if alt:
             return normalize_fbo_name(alt)
 
-    # 4) plain text cell
     text = clean_text(biz_td.get_text(" ", strip=True))
     if text:
         return normalize_fbo_name(text)
@@ -229,8 +228,7 @@ def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, 
         if not cells:
             continue
 
-        # Service row
-        m = re.match(r"^(FS|SS|RA|AS)\b", row_text)
+        m = re.match(r"^(FS|SS|RA|AS|PS)\b", row_text)
         if m:
             svc_code = m.group(1).upper()
             if svc_code not in SERVICE_MAP:
@@ -255,12 +253,22 @@ def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, 
 
             continue
 
-        # Header row
         order: List[str] = []
         for td in cells:
             txt = clean_text(td.get_text(" ", strip=True)).upper()
 
-            for token in ("100LL", "MOGAS", "UL91", "JET A", "JET-A", "JETA", "SAF"):
+            for token in (
+                "100LL",
+                "MOGAS",
+                "UL91",
+                "JET A+",
+                "JET-A+",
+                "JETA+",
+                "JET A",
+                "JET-A",
+                "JETA",
+                "SAF",
+            ):
                 if token in txt:
                     fuel = canonical_airnav_fuel(token)
                     if fuel and fuel not in order:
@@ -272,24 +280,10 @@ def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, 
     cleaned: Dict[str, str] = {}
 
     for fuel in SUPPORTED_FUELS:
-        full_key = f"{fuel}_FULL"
-        self_key = f"{fuel}_SELF"
-        ra_key = f"{fuel}_RA"
-
-        full_val = prices_raw.get(full_key)
-        self_val = prices_raw.get(self_key)
-
-        # sanity check only where both full/self exist
-        if full_val is not None and self_val is not None and self_val > full_val:
-            full_val = None
-            self_val = None
-
-        if full_val is not None:
-            cleaned[full_key] = format_price(full_val)
-        if self_val is not None:
-            cleaned[self_key] = format_price(self_val)
-        if ra_key in prices_raw:
-            cleaned[ra_key] = format_price(prices_raw[ra_key])
+        for suffix in ("FULL", "SELF", "RA"):
+            key = f"{fuel}_{suffix}"
+            if key in prices_raw:
+                cleaned[key] = format_price(prices_raw[key])
 
     return cleaned, guaranteed, last_update_date
 
