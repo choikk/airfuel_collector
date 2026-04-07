@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -145,6 +146,19 @@ def insert_new_row(
     )
 
 
+def rename_open_rows_fbo(cur, airport_code, old_fbo_name, new_fbo_name):
+    cur.execute(
+        """
+        UPDATE price_periods
+        SET fbo_name = %s
+        WHERE airport_code = %s
+          AND fbo_name = %s
+          AND valid_to IS NULL
+        """,
+        (new_fbo_name, airport_code, old_fbo_name),
+    )
+
+
 def normalize_scraped_prices(scraped: dict):
     """
     Convert scraper JSON into:
@@ -189,6 +203,96 @@ def bump_check_priority_only(cur, airport_code: str):
     )
 
 
+def fuel_family_from_price_keys(keys):
+    return tuple(sorted({fuel_type for _, fuel_type, _ in keys}))
+
+
+def group_existing_open_rows_by_fbo(existing_open_rows):
+    groups = defaultdict(list)
+    for row in existing_open_rows.values():
+        groups[row["fbo_name"]].append(row)
+
+    out = {}
+    for fbo_name, rows in groups.items():
+        out[fbo_name] = {
+            "rows": rows,
+            "fuel_family": tuple(sorted({row["fuel_type"] for row in rows})),
+        }
+    return out
+
+
+def group_scraped_prices_by_fbo(scraped_prices):
+    groups = defaultdict(list)
+    for key, data in scraped_prices.items():
+        fbo_name, fuel_type, service_type = key
+        groups[fbo_name].append((key, data))
+
+    out = {}
+    for fbo_name, items in groups.items():
+        out[fbo_name] = {
+            "items": items,
+            "fuel_family": tuple(sorted({fuel_type for (_, fuel_type, _), _ in items})),
+        }
+    return out
+
+
+def apply_fbo_name_corrections(cur, airport_code, existing_open_rows, scraped_prices):
+    """
+    Rule:
+    - If airport_code matches
+    - and fuel family set matches
+    - but FBO name differs
+    then rename the open DB rows to the new FBO name instead of treating them
+    as a different provider.
+
+    Safety:
+    - Only rename when there is exactly one matching existing FBO group by fuel family.
+    - If there are multiple candidates with the same fuel family, do nothing.
+    """
+    if not existing_open_rows or not scraped_prices:
+        return existing_open_rows
+
+    existing_groups = group_existing_open_rows_by_fbo(existing_open_rows)
+    scraped_groups = group_scraped_prices_by_fbo(scraped_prices)
+
+    renamed_existing = dict(existing_open_rows)
+
+    for new_fbo_name, scraped_group in scraped_groups.items():
+        if new_fbo_name in existing_groups:
+            continue
+
+        matching_existing_fbos = [
+            old_fbo_name
+            for old_fbo_name, existing_group in existing_groups.items()
+            if existing_group["fuel_family"] == scraped_group["fuel_family"]
+        ]
+
+        if len(matching_existing_fbos) != 1:
+            continue
+
+        old_fbo_name = matching_existing_fbos[0]
+        if old_fbo_name == new_fbo_name:
+            continue
+
+        rename_open_rows_fbo(cur, airport_code, old_fbo_name, new_fbo_name)
+
+        updated = {}
+        for key, row in renamed_existing.items():
+            fbo_name, fuel_type, service_type = key
+            if fbo_name == old_fbo_name:
+                new_key = (new_fbo_name, fuel_type, service_type)
+                new_row = dict(row)
+                new_row["fbo_name"] = new_fbo_name
+                updated[new_key] = new_row
+            else:
+                updated[key] = row
+        renamed_existing = updated
+
+        existing_groups = group_existing_open_rows_by_fbo(renamed_existing)
+
+    return renamed_existing
+
+
 def process_airport(airport_code: str):
     scraped = run_scraper(airport_code)
     ts = now_utc()
@@ -222,7 +326,15 @@ def process_airport(airport_code: str):
                 conn.commit()
                 return scraped
 
-            # 2. Airport exists in DB -> compare all current prices
+            # 2. Correct wrong FBO names first, when airport_code + fuel family match
+            existing_open_rows = apply_fbo_name_corrections(
+                cur,
+                airport_code,
+                existing_open_rows,
+                scraped_prices,
+            )
+
+            # 3. Compare all current prices after any name correction
             existing_price_map = {
                 key: row["price"] for key, row in existing_open_rows.items()
             }
@@ -230,13 +342,13 @@ def process_airport(airport_code: str):
                 key: data["price"] for key, data in scraped_prices.items()
             }
 
-            # 3. If all prices identical -> update last_seen_at only
+            # 4. If all prices identical -> update last_seen_at only
             if existing_price_map == scraped_price_map:
                 touch_open_rows_for_airport(cur, airport_code, ts)
                 conn.commit()
                 return scraped
 
-            # 4. If any price changed -> write price history
+            # 5. If any price changed -> write price history
             # Close rows that disappeared or changed
             for key, old_row in existing_open_rows.items():
                 if key not in scraped_prices:
@@ -247,7 +359,7 @@ def process_airport(airport_code: str):
                 if old_row["price"] != new_price:
                     close_open_row(cur, old_row["id"], ts)
 
-            # Insert rows that are new or changed
+            # 6. Insert rows that are new or changed
             for key, new_data in scraped_prices.items():
                 fbo_name, fuel_type, service_type = key
 

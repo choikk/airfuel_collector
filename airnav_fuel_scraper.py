@@ -15,7 +15,7 @@ Behavior:
 - Robust row-based AirNav parser
 - Handles plain-text business names (KPYG, KLXV, KLXL, KMNM)
 - Handles image-alt business names (KIAD)
-- Supports 100LL / MOGAS / UL91 / JET A / SAF
+- Supports 100LL / MOGAS / UL94 / UL91 / JET A / SAF
 - Treats PS (pump service) as FULL
 - Stops before "Alternatives at nearby airports"
 - Falls back to FltPlan only if AirNav yields no providers
@@ -46,7 +46,7 @@ SERVICE_MAP = {
     "PS": "FULL",
 }
 
-SUPPORTED_FUELS = ("100LL", "MOGAS", "UL91", "JET_A", "SAF")
+SUPPORTED_FUELS = ("100LL", "MOGAS", "UL94", "UL91", "JET_A", "SAF")
 
 
 def clean_text(text: str) -> str:
@@ -123,6 +123,8 @@ def canonical_airnav_fuel(token: str) -> Optional[str]:
         return "MOGAS"
     if t == "UL91":
         return "UL91"
+    if t == "UL94":
+        return "UL94"
     if t in {"JET A", "JET-A", "JETA", "JET A+", "JET-A+", "JETA+"}:
         return "JET_A"
     if t == "SAF":
@@ -261,6 +263,7 @@ def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, 
                 "100LL",
                 "MOGAS",
                 "UL91",
+                "UL94",
                 "JET A+",
                 "JET-A+",
                 "JETA+",
@@ -364,6 +367,8 @@ def normalize_fltplan_fuel(header: str) -> Optional[str]:
         return "100LL"
     if s == "MOGAS":
         return "MOGAS"
+    if s == "UL94":
+        return "UL94"
     if s == "UL91":
         return "UL91"
     if s in {"JET", "JET A", "JETA", "JET-A", "JETA+FSII", "JET A+FSII", "JET-A+FSII"}:
@@ -427,7 +432,7 @@ def parse_fltplan_table(soup: BeautifulSoup, airport_code: str) -> List[Dict[str
                 continue
 
             if len(upper) >= 2 and upper[0] == "SERVICE":
-                if any(h in upper for h in ["JET", "JET A", "JETA", "JET-A", "100LL", "MOGAS", "UL91", "SAF"]):
+                if any(h in upper for h in ["JET", "JET A", "JETA", "JET-A", "100LL", "MOGAS", "UL94", "UL91", "SAF"]):
                     header_row_idx = i
                     header_cells_text = texts
                     break
