@@ -43,13 +43,6 @@ def run_scraper(airport_code: str) -> dict:
 
 
 def resolve_airport_identity(cur, requested_airport_code: str):
-    """
-    Return canonical airports_v2 airport_code + site_no.
-
-    1. Try airports_v2 directly by airport_code
-    2. Fallback: look up legacy airports.site_no by airport_code,
-       then resolve canonical airport_code in airports_v2 by site_no
-    """
     cur.execute(
         """
         SELECT airport_code, site_no
@@ -59,40 +52,9 @@ def resolve_airport_identity(cur, requested_airport_code: str):
         (requested_airport_code,),
     )
     row = cur.fetchone()
-    if row:
-        return row[0], row[1]
 
-    cur.execute(
-        """
-        SELECT site_no
-        FROM airports
-        WHERE airport_code = %s
-        """,
-        (requested_airport_code,),
-    )
-    legacy = cur.fetchone()
-    if not legacy or not legacy[0]:
-        raise RuntimeError(
-            f"Could not resolve airport_code={requested_airport_code} "
-            f"to airports_v2/site_no"
-        )
-
-    site_no = legacy[0]
-
-    cur.execute(
-        """
-        SELECT airport_code, site_no
-        FROM airports_v2
-        WHERE site_no = %s
-        """,
-        (site_no,),
-    )
-    row = cur.fetchone()
     if not row:
-        raise RuntimeError(
-            f"site_no={site_no} from legacy airports did not match airports_v2 "
-            f"for requested airport_code={requested_airport_code}"
-        )
+        raise RuntimeError(f"Unknown airport_code={requested_airport_code}")
 
     return row[0], row[1]
 
