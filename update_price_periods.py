@@ -42,12 +42,68 @@ def run_scraper(airport_code: str) -> dict:
     return json.loads(result.stdout)
 
 
-def get_open_rows_for_airport(cur, airport_code):
+def resolve_airport_identity(cur, requested_airport_code: str):
+    """
+    Return canonical airports_v2 airport_code + site_no.
+
+    1. Try airports_v2 directly by airport_code
+    2. Fallback: look up legacy airports.site_no by airport_code,
+       then resolve canonical airport_code in airports_v2 by site_no
+    """
+    cur.execute(
+        """
+        SELECT airport_code, site_no
+        FROM airports_v2
+        WHERE airport_code = %s
+        """,
+        (requested_airport_code,),
+    )
+    row = cur.fetchone()
+    if row:
+        return row[0], row[1]
+
+    cur.execute(
+        """
+        SELECT site_no
+        FROM airports
+        WHERE airport_code = %s
+        """,
+        (requested_airport_code,),
+    )
+    legacy = cur.fetchone()
+    if not legacy or not legacy[0]:
+        raise RuntimeError(
+            f"Could not resolve airport_code={requested_airport_code} "
+            f"to airports_v2/site_no"
+        )
+
+    site_no = legacy[0]
+
+    cur.execute(
+        """
+        SELECT airport_code, site_no
+        FROM airports_v2
+        WHERE site_no = %s
+        """,
+        (site_no,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(
+            f"site_no={site_no} from legacy airports did not match airports_v2 "
+            f"for requested airport_code={requested_airport_code}"
+        )
+
+    return row[0], row[1]
+
+
+def get_open_rows_for_site(cur, site_no):
     cur.execute(
         """
         SELECT
             id,
             airport_code,
+            site_no,
             fbo_name,
             fuel_type,
             service_type,
@@ -55,20 +111,31 @@ def get_open_rows_for_airport(cur, airport_code):
             reported_date,
             guaranteed
         FROM price_periods
-        WHERE airport_code = %s
+        WHERE site_no = %s
           AND valid_to IS NULL
         """,
-        (airport_code,),
+        (site_no,),
     )
     rows = cur.fetchall()
 
     out = {}
     for row in rows:
-        row_id, airport_code, fbo_name, fuel_type, service_type, price, reported_date, guaranteed = row
+        (
+            row_id,
+            airport_code,
+            row_site_no,
+            fbo_name,
+            fuel_type,
+            service_type,
+            price,
+            reported_date,
+            guaranteed,
+        ) = row
         key = (fbo_name, fuel_type, service_type)
         out[key] = {
             "id": row_id,
             "airport_code": airport_code,
+            "site_no": row_site_no,
             "fbo_name": fbo_name,
             "fuel_type": fuel_type,
             "service_type": service_type,
@@ -91,21 +158,22 @@ def close_open_row(cur, row_id, closed_at):
     )
 
 
-def touch_open_rows_for_airport(cur, airport_code, seen_at):
+def touch_open_rows_for_site(cur, site_no, seen_at):
     cur.execute(
         """
         UPDATE price_periods
         SET last_seen_at = %s
-        WHERE airport_code = %s
+        WHERE site_no = %s
           AND valid_to IS NULL
         """,
-        (seen_at, airport_code),
+        (seen_at, site_no),
     )
 
 
 def insert_new_row(
     cur,
     airport_code,
+    site_no,
     fbo_name,
     fuel_type,
     service_type,
@@ -118,6 +186,7 @@ def insert_new_row(
         """
         INSERT INTO price_periods (
             airport_code,
+            site_no,
             fbo_name,
             fuel_type,
             service_type,
@@ -129,10 +198,11 @@ def insert_new_row(
             first_seen_at,
             last_seen_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
         """,
         (
             airport_code,
+            site_no,
             fbo_name,
             fuel_type,
             service_type,
@@ -146,16 +216,16 @@ def insert_new_row(
     )
 
 
-def rename_open_rows_fbo(cur, airport_code, old_fbo_name, new_fbo_name):
+def rename_open_rows_fbo(cur, site_no, old_fbo_name, new_fbo_name):
     cur.execute(
         """
         UPDATE price_periods
         SET fbo_name = %s
-        WHERE airport_code = %s
+        WHERE site_no = %s
           AND fbo_name = %s
           AND valid_to IS NULL
         """,
-        (new_fbo_name, airport_code, old_fbo_name),
+        (new_fbo_name, site_no, old_fbo_name),
     )
 
 
@@ -192,19 +262,43 @@ def normalize_scraped_prices(scraped: dict):
     return out
 
 
-def bump_check_priority_only(cur, airport_code: str):
+def bump_check_priority_only(cur, airport_code: str, checked_at):
+    """
+    No prices found from AirNav/FltPlan.
+    Bump scheduler priority in airport_scrape_status_v2.
+    """
     cur.execute(
         """
-        UPDATE airports
-        SET check_priority = LEAST(COALESCE(check_priority, 2) + 1, 5)
-        WHERE airport_code = %s
+        INSERT INTO airport_scrape_status_v2 (
+            airport_code,
+            last_checked_at,
+            check_priority
+        )
+        VALUES (%s, %s, 3)
+        ON CONFLICT (airport_code) DO UPDATE
+        SET last_checked_at = EXCLUDED.last_checked_at,
+            check_priority = LEAST(
+                COALESCE(airport_scrape_status_v2.check_priority, 2) + 1,
+                5
+            )
         """,
-        (airport_code,),
+        (airport_code, checked_at),
     )
 
 
-def fuel_family_from_price_keys(keys):
-    return tuple(sorted({fuel_type for _, fuel_type, _ in keys}))
+def mark_checked(cur, airport_code: str, checked_at):
+    cur.execute(
+        """
+        INSERT INTO airport_scrape_status_v2 (
+            airport_code,
+            last_checked_at
+        )
+        VALUES (%s, %s)
+        ON CONFLICT (airport_code) DO UPDATE
+        SET last_checked_at = EXCLUDED.last_checked_at
+        """,
+        (airport_code, checked_at),
+    )
 
 
 def group_existing_open_rows_by_fbo(existing_open_rows):
@@ -236,18 +330,15 @@ def group_scraped_prices_by_fbo(scraped_prices):
     return out
 
 
-def apply_fbo_name_corrections(cur, airport_code, existing_open_rows, scraped_prices):
+def apply_fbo_name_corrections(cur, site_no, existing_open_rows, scraped_prices):
     """
     Rule:
-    - If airport_code matches
-    - and fuel family set matches
-    - but FBO name differs
-    then rename the open DB rows to the new FBO name instead of treating them
-    as a different provider.
+    - Match within same airport via site_no
+    - If fuel family matches exactly but FBO name differs,
+      rename open rows instead of treating them as a different provider
 
     Safety:
-    - Only rename when there is exactly one matching existing FBO group by fuel family.
-    - If there are multiple candidates with the same fuel family, do nothing.
+    - Only rename when exactly one candidate existing FBO group matches the fuel family
     """
     if not existing_open_rows or not scraped_prices:
         return existing_open_rows
@@ -274,7 +365,7 @@ def apply_fbo_name_corrections(cur, airport_code, existing_open_rows, scraped_pr
         if old_fbo_name == new_fbo_name:
             continue
 
-        rename_open_rows_fbo(cur, airport_code, old_fbo_name, new_fbo_name)
+        rename_open_rows_fbo(cur, site_no, old_fbo_name, new_fbo_name)
 
         updated = {}
         for key, row in renamed_existing.items():
@@ -286,35 +377,42 @@ def apply_fbo_name_corrections(cur, airport_code, existing_open_rows, scraped_pr
                 updated[new_key] = new_row
             else:
                 updated[key] = row
-        renamed_existing = updated
 
+        renamed_existing = updated
         existing_groups = group_existing_open_rows_by_fbo(renamed_existing)
 
     return renamed_existing
 
 
-def process_airport(airport_code: str):
-    scraped = run_scraper(airport_code)
+def process_airport(requested_airport_code: str):
     ts = now_utc()
-
-    scraped_prices = normalize_scraped_prices(scraped)
 
     with connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            existing_open_rows = get_open_rows_for_airport(cur, airport_code)
+            canonical_airport_code, site_no = resolve_airport_identity(
+                cur, requested_airport_code
+            )
 
-            # 0. If both AirNav and FltPlan returned no prices, only bump check_priority
+            scraped = run_scraper(canonical_airport_code)
+            scraped_prices = normalize_scraped_prices(scraped)
+
+            existing_open_rows = get_open_rows_for_site(cur, site_no)
+
+            # If both AirNav and FltPlan returned no prices, only bump priority
             if not scraped_prices:
-                bump_check_priority_only(cur, airport_code)
+                bump_check_priority_only(cur, canonical_airport_code, ts)
                 conn.commit()
                 return scraped
 
-            # 1. If airport not in DB at all, write all scraped prices
+            mark_checked(cur, canonical_airport_code, ts)
+
+            # If airport has no open rows yet, insert all scraped prices
             if not existing_open_rows:
                 for (fbo_name, fuel_type, service_type), data in scraped_prices.items():
                     insert_new_row(
                         cur,
-                        airport_code,
+                        canonical_airport_code,
+                        site_no,
                         fbo_name,
                         fuel_type,
                         service_type,
@@ -326,15 +424,14 @@ def process_airport(airport_code: str):
                 conn.commit()
                 return scraped
 
-            # 2. Correct wrong FBO names first, when airport_code + fuel family match
+            # Correct renamed FBOs first
             existing_open_rows = apply_fbo_name_corrections(
                 cur,
-                airport_code,
+                site_no,
                 existing_open_rows,
                 scraped_prices,
             )
 
-            # 3. Compare all current prices after any name correction
             existing_price_map = {
                 key: row["price"] for key, row in existing_open_rows.items()
             }
@@ -342,13 +439,12 @@ def process_airport(airport_code: str):
                 key: data["price"] for key, data in scraped_prices.items()
             }
 
-            # 4. If all prices identical -> update last_seen_at only
+            # If all prices identical, only update last_seen_at
             if existing_price_map == scraped_price_map:
-                touch_open_rows_for_airport(cur, airport_code, ts)
+                touch_open_rows_for_site(cur, site_no, ts)
                 conn.commit()
                 return scraped
 
-            # 5. If any price changed -> write price history
             # Close rows that disappeared or changed
             for key, old_row in existing_open_rows.items():
                 if key not in scraped_prices:
@@ -359,14 +455,15 @@ def process_airport(airport_code: str):
                 if old_row["price"] != new_price:
                     close_open_row(cur, old_row["id"], ts)
 
-            # 6. Insert rows that are new or changed
+            # Insert rows that are new or changed
             for key, new_data in scraped_prices.items():
                 fbo_name, fuel_type, service_type = key
 
                 if key not in existing_open_rows:
                     insert_new_row(
                         cur,
-                        airport_code,
+                        canonical_airport_code,
+                        site_no,
                         fbo_name,
                         fuel_type,
                         service_type,
@@ -381,7 +478,8 @@ def process_airport(airport_code: str):
                 if old_row["price"] != new_data["price"]:
                     insert_new_row(
                         cur,
-                        airport_code,
+                        canonical_airport_code,
+                        site_no,
                         fbo_name,
                         fuel_type,
                         service_type,

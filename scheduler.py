@@ -16,7 +16,7 @@ UPDATE_SCRIPT = str(BASE_DIR / "update_price_periods.py")
 
 # conservative defaults
 MAX_AIRPORTS_PER_RUN = 25
-MIN_DELAY_SECONDS =  9
+MIN_DELAY_SECONDS = 9
 MAX_DELAY_SECONDS = 18
 
 
@@ -71,25 +71,36 @@ def compute_next_check_at(
 
 
 def fetch_due_airports(cur, limit: int):
+    """
+    Use airports_v2 for airport metadata and airport_scrape_status_v2
+    for scheduler state.
+
+    We select airports that:
+    - have some fuel indicated in airports_v2.fuel_raw
+    - have never been checked, or are due now
+    """
     cur.execute(
         """
         SELECT
-            airport_code,
-            airspace_class,
-            COALESCE(consecutive_no_change_count, 0) AS consecutive_no_change_count
-        FROM airports
-        WHERE fuel_raw IS NOT NULL
-          AND btrim(fuel_raw) <> ''
-          AND upper(btrim(fuel_raw)) <> 'NONE'
+            a.airport_code,
+            a.airspace_class,
+            COALESCE(s.consecutive_no_change_count, 0) AS consecutive_no_change_count
+        FROM airports_v2 a
+        LEFT JOIN airport_scrape_status_v2 s
+          ON s.airport_code = a.airport_code
+        WHERE a.fuel_raw IS NOT NULL
+          AND btrim(a.fuel_raw) <> ''
+          AND upper(btrim(a.fuel_raw)) <> 'NONE'
           AND (
-                last_checked_at IS NULL
-                OR next_check_at <= NOW()
+                s.last_checked_at IS NULL
+                OR s.next_check_at IS NULL
+                OR s.next_check_at <= NOW()
               )
         ORDER BY
-            last_checked_at ASC NULLS FIRST,
-            COALESCE(check_priority, 2) ASC,
-            CASE WHEN last_checked_at IS NULL THEN random() ELSE 0 END,
-            airport_code ASC
+            s.last_checked_at ASC NULLS FIRST,
+            COALESCE(s.check_priority, 2) ASC,
+            CASE WHEN s.last_checked_at IS NULL THEN random() ELSE 0 END,
+            a.airport_code ASC
         LIMIT %s
         """,
         (limit,),
@@ -97,7 +108,28 @@ def fetch_due_airports(cur, limit: int):
     return cur.fetchall()
 
 
+def get_site_no_for_airport(cur, airport_code: str) -> str:
+    cur.execute(
+        """
+        SELECT site_no
+        FROM airports_v2
+        WHERE airport_code = %s
+        """,
+        (airport_code,),
+    )
+    row = cur.fetchone()
+    if not row or not row[0]:
+        raise RuntimeError(f"site_no not found in airports_v2 for airport_code={airport_code}")
+    return row[0]
+
+
 def get_price_snapshot(cur, airport_code: str):
+    """
+    Compare current open prices by site_no, not by legacy airport_code.
+    This avoids code-change issues and matches the new update_price_periods.py logic.
+    """
+    site_no = get_site_no_for_airport(cur, airport_code)
+
     cur.execute(
         """
         SELECT
@@ -106,11 +138,11 @@ def get_price_snapshot(cur, airport_code: str):
             service_type,
             price
         FROM price_periods
-        WHERE airport_code = %s
+        WHERE site_no = %s
           AND valid_to IS NULL
         ORDER BY fbo_name, fuel_type, service_type
         """,
-        (airport_code,),
+        (site_no,),
     )
     rows = cur.fetchall()
     return tuple(rows)
@@ -141,25 +173,40 @@ def update_airport_schedule(
     if changed:
         cur.execute(
             """
-            UPDATE airports
-            SET last_checked_at = %s,
-                next_check_at = %s,
-                last_change_at = %s,
-                consecutive_no_change_count = %s
-            WHERE airport_code = %s
+            INSERT INTO airport_scrape_status_v2 (
+                airport_code,
+                last_checked_at,
+                next_check_at,
+                check_priority,
+                last_change_at,
+                consecutive_no_change_count
+            )
+            VALUES (%s, %s, %s, 2, %s, %s)
+            ON CONFLICT (airport_code) DO UPDATE
+            SET last_checked_at = EXCLUDED.last_checked_at,
+                next_check_at = EXCLUDED.next_check_at,
+                last_change_at = EXCLUDED.last_change_at,
+                consecutive_no_change_count = EXCLUDED.consecutive_no_change_count
             """,
-            (current_ts, next_check_at, last_change_at, next_count, airport_code),
+            (airport_code, current_ts, next_check_at, last_change_at, next_count),
         )
     else:
         cur.execute(
             """
-            UPDATE airports
-            SET last_checked_at = %s,
-                next_check_at = %s,
-                consecutive_no_change_count = %s
-            WHERE airport_code = %s
+            INSERT INTO airport_scrape_status_v2 (
+                airport_code,
+                last_checked_at,
+                next_check_at,
+                check_priority,
+                consecutive_no_change_count
+            )
+            VALUES (%s, %s, %s, 2, %s)
+            ON CONFLICT (airport_code) DO UPDATE
+            SET last_checked_at = EXCLUDED.last_checked_at,
+                next_check_at = EXCLUDED.next_check_at,
+                consecutive_no_change_count = EXCLUDED.consecutive_no_change_count
             """,
-            (current_ts, next_check_at, next_count, airport_code),
+            (airport_code, current_ts, next_check_at, next_count),
         )
 
 
