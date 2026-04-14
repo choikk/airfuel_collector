@@ -20,12 +20,14 @@ MAX_DELAY_SECONDS = 15
 
 def fetch_target_airports(conn):
     sql = """
-        SELECT DISTINCT airport_code
-        FROM price_periods
-        WHERE lower(btrim(fbo_name)) = lower(%s)
-          AND airport_code IS NOT NULL
-          AND btrim(airport_code) <> ''
-        ORDER BY airport_code
+        SELECT DISTINCT a.airport_code
+        FROM price_periods p
+        JOIN airports_v2 a
+          ON a.site_no = p.site_no
+        WHERE lower(btrim(p.fbo_name)) = lower(%s)
+          AND a.airport_code IS NOT NULL
+          AND btrim(a.airport_code) <> ''
+        ORDER BY a.airport_code
     """
     with conn.cursor() as cur:
         cur.execute(sql, (TARGET_FBO_NAME,))

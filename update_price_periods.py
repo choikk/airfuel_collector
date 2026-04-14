@@ -45,18 +45,69 @@ def run_scraper(airport_code: str) -> dict:
 def resolve_airport_identity(cur, requested_airport_code: str):
     cur.execute(
         """
-        SELECT airport_code, site_no
-        FROM airports_v2
-        WHERE airport_code = %s
+        SELECT a.airport_code, a.site_no
+        FROM airports_v2 a
+        WHERE a.airport_code = %s
+
+        UNION ALL
+
+        SELECT a.airport_code, a.site_no
+        FROM airport_code_map m
+        JOIN airports_v2 a
+          ON a.airport_code = m.new_airport_code
+        WHERE m.old_airport_code = %s
+        LIMIT 1
         """,
-        (requested_airport_code,),
+        (requested_airport_code, requested_airport_code),
     )
     row = cur.fetchone()
 
     if not row:
         raise RuntimeError(f"Unknown airport_code={requested_airport_code}")
+    if not row[1]:
+        raise RuntimeError(f"site_no missing for airport_code={row[0]}")
 
     return row[0], row[1]
+
+
+def ensure_price_periods_fk_migrated(cur):
+    cur.execute(
+        """
+        SELECT confrel.relname
+        FROM pg_constraint con
+        JOIN pg_class rel
+          ON rel.oid = con.conrelid
+        JOIN pg_class confrel
+          ON confrel.oid = con.confrelid
+        WHERE con.conname = 'price_periods_airport_code_fkey'
+          AND rel.relname = 'price_periods'
+        """
+    )
+    row = cur.fetchone()
+
+    if not row:
+        return
+
+    parent_table = row[0]
+    if parent_table != "airports_v2":
+        raise RuntimeError(
+            "Database schema still points price_periods_airport_code_fkey "
+            f"at {parent_table}. Apply migrations/"
+            "2026-04-14_remove_airports_legacy_backup_dependency.sql first."
+        )
+
+
+def sync_open_rows_airport_code(cur, site_no: str, airport_code: str):
+    cur.execute(
+        """
+        UPDATE price_periods
+        SET airport_code = %s
+        WHERE site_no = %s
+          AND valid_to IS NULL
+          AND airport_code <> %s
+        """,
+        (airport_code, site_no, airport_code),
+    )
 
 
 def get_open_rows_for_site(cur, site_no):
@@ -351,6 +402,7 @@ def process_airport(requested_airport_code: str):
 
     with connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
+            ensure_price_periods_fk_migrated(cur)
             canonical_airport_code, site_no = resolve_airport_identity(
                 cur, requested_airport_code
             )
@@ -358,6 +410,7 @@ def process_airport(requested_airport_code: str):
             scraped = run_scraper(canonical_airport_code)
             scraped_prices = normalize_scraped_prices(scraped)
 
+            sync_open_rows_airport_code(cur, site_no, canonical_airport_code)
             existing_open_rows = get_open_rows_for_site(cur, site_no)
 
             # If both AirNav and FltPlan returned no prices, only bump priority

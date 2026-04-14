@@ -5,31 +5,42 @@ import os
 from pathlib import Path
 
 from psycopg import connect
+from psycopg.types.json import Json
 
 BASE_DIR = Path(__file__).resolve().parent
 JSON_PATH = BASE_DIR / "airport_base_info_with_runways_airspace_approaches.json"
 DATABASE_URL = os.environ["NEON_DATABASE_URL"]
 
 INSERT_SQL = """
-INSERT INTO airports (
+INSERT INTO airports_v2 (
     airport_code,
+    site_no,
     airport_name,
     city,
     state,
+    country,
     lat,
     lon,
+    elevation,
     fuel_raw,
-    airspace_class
+    airspace_class,
+    remarks,
+    raw_json
 )
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (airport_code) DO UPDATE SET
+    site_no = EXCLUDED.site_no,
     airport_name = EXCLUDED.airport_name,
     city = EXCLUDED.city,
     state = EXCLUDED.state,
+    country = EXCLUDED.country,
     lat = EXCLUDED.lat,
     lon = EXCLUDED.lon,
+    elevation = EXCLUDED.elevation,
     fuel_raw = EXCLUDED.fuel_raw,
-    airspace_class = EXCLUDED.airspace_class
+    airspace_class = EXCLUDED.airspace_class,
+    remarks = EXCLUDED.remarks,
+    raw_json = EXCLUDED.raw_json
 """
 
 
@@ -60,13 +71,18 @@ def main():
         rows.append(
             (
                 airport_code,
+                info.get("site_no"),
                 info.get("airport_name"),
                 info.get("city"),
                 info.get("state"),
+                info.get("country") or "US",
                 info.get("lat"),
                 info.get("lon"),
+                info.get("elevation"),
                 fuel_raw,
                 normalize_airspace_class(info.get("airspace")),
+                info.get("remarks"),
+                Json(info),
             )
         )
 
