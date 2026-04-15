@@ -118,6 +118,7 @@ def get_open_rows_for_site(cur, site_no):
             airport_code,
             site_no,
             fbo_name,
+            fbo_phone,
             fuel_type,
             service_type,
             price,
@@ -138,6 +139,7 @@ def get_open_rows_for_site(cur, site_no):
             airport_code,
             row_site_no,
             fbo_name,
+            fbo_phone,
             fuel_type,
             service_type,
             price,
@@ -150,6 +152,7 @@ def get_open_rows_for_site(cur, site_no):
             "airport_code": airport_code,
             "site_no": row_site_no,
             "fbo_name": fbo_name,
+            "fbo_phone": fbo_phone,
             "fuel_type": fuel_type,
             "service_type": service_type,
             "price": Decimal(price),
@@ -188,6 +191,7 @@ def insert_new_row(
     airport_code,
     site_no,
     fbo_name,
+    fbo_phone,
     fuel_type,
     service_type,
     price,
@@ -201,6 +205,7 @@ def insert_new_row(
             airport_code,
             site_no,
             fbo_name,
+            fbo_phone,
             fuel_type,
             service_type,
             price,
@@ -211,12 +216,13 @@ def insert_new_row(
             first_seen_at,
             last_seen_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
         """,
         (
             airport_code,
             site_no,
             fbo_name,
+            fbo_phone,
             fuel_type,
             service_type,
             price,
@@ -226,6 +232,20 @@ def insert_new_row(
             ts,
             ts,
         ),
+    )
+
+
+def sync_open_rows_fbo_phone(cur, site_no: str, fbo_name: str, fbo_phone: str | None):
+    cur.execute(
+        """
+        UPDATE price_periods
+        SET fbo_phone = %s
+        WHERE site_no = %s
+          AND fbo_name = %s
+          AND valid_to IS NULL
+          AND fbo_phone IS DISTINCT FROM %s
+        """,
+        (fbo_phone, site_no, fbo_name, fbo_phone),
     )
 
 
@@ -257,6 +277,7 @@ def normalize_scraped_prices(scraped: dict):
 
     for provider in scraped.get("providers", []):
         fbo_name = provider["fbo_name"]
+        fbo_phone = provider.get("fbo_phone")
         reported_date = provider.get("last_update_date")
         guaranteed = bool(provider.get("guaranteed", False))
 
@@ -267,6 +288,7 @@ def normalize_scraped_prices(scraped: dict):
             fuel_type, service_type = split_price_key(price_key)
 
             out[(fbo_name, fuel_type, service_type)] = {
+                "fbo_phone": fbo_phone,
                 "price": Decimal(price_str),
                 "reported_date": reported_date,
                 "guaranteed": guaranteed,
@@ -421,6 +443,14 @@ def process_airport(requested_airport_code: str):
 
             mark_checked(cur, canonical_airport_code, ts)
 
+            for (fbo_name, _, _), data in scraped_prices.items():
+                sync_open_rows_fbo_phone(
+                    cur,
+                    site_no,
+                    fbo_name,
+                    data["fbo_phone"],
+                )
+
             # If airport has no open rows yet, insert all scraped prices
             if not existing_open_rows:
                 for (fbo_name, fuel_type, service_type), data in scraped_prices.items():
@@ -429,6 +459,7 @@ def process_airport(requested_airport_code: str):
                         canonical_airport_code,
                         site_no,
                         fbo_name,
+                        data["fbo_phone"],
                         fuel_type,
                         service_type,
                         data["price"],
@@ -480,6 +511,7 @@ def process_airport(requested_airport_code: str):
                         canonical_airport_code,
                         site_no,
                         fbo_name,
+                        new_data["fbo_phone"],
                         fuel_type,
                         service_type,
                         new_data["price"],
@@ -496,6 +528,7 @@ def process_airport(requested_airport_code: str):
                         canonical_airport_code,
                         site_no,
                         fbo_name,
+                        new_data["fbo_phone"],
                         fuel_type,
                         service_type,
                         new_data["price"],

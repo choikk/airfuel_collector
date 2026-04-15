@@ -47,6 +47,13 @@ SERVICE_MAP = {
 }
 
 SUPPORTED_FUELS = ("100LL", "MOGAS", "UL94", "UL91", "JET_A", "SAF")
+PHONE_RE = re.compile(
+    r"(?:(?:\+?1[\s.\-]*)?)"
+    r"(?:\(?\d{3}\)?[\s.\-]*)"
+    r"\d{3}[\s.\-]*\d{4}"
+    r"(?:\s*(?:x|ext\.?|extension)\s*\d+)?",
+    flags=re.I,
+)
 
 
 def clean_text(text: str) -> str:
@@ -62,9 +69,21 @@ def normalize_airport_code(code: str) -> str:
 
 def normalize_fbo_name(name: str) -> str:
     name = clean_text(name)
-    name = re.sub(r"^More info(?: and photos)? of\s+", "", name, flags=re.I)
+    name = re.sub(
+        r"^More info(?:(?: and photos)? of| about)\s+",
+        "",
+        name,
+        flags=re.I,
+    )
     name = re.sub(r"\s+", " ", name).strip(" ,")
     return name
+
+
+def extract_phone(text: str) -> Optional[str]:
+    match = PHONE_RE.search(clean_text(text))
+    if not match:
+        return None
+    return clean_text(match.group(0))
 
 
 def fetch_url(url: str) -> str:
@@ -200,6 +219,131 @@ def extract_airnav_fbo_name(biz_td: Tag, airport_code: str) -> Optional[str]:
     return None
 
 
+def extract_airnav_fbo_phone_from_cells(cells: List[Tag]) -> Optional[str]:
+    for td in cells:
+        for a in td.find_all("a", href=True):
+            href = clean_text(a.get("href", ""))
+            if href.lower().startswith("tel:"):
+                return clean_text(href[4:])
+
+        phone = extract_phone(td.get_text(" ", strip=True))
+        if phone:
+            return phone
+
+    return None
+
+
+def is_probable_airnav_name_text(text: str) -> bool:
+    text = clean_text(text)
+    if not text:
+        return False
+
+    upper = text.upper()
+    blocked_markers = (
+        "WEB SITE",
+        "EMAIL",
+        "ASRI",
+        "FREQ",
+        "AIRCARD",
+        "CONTRACT FUEL",
+        "GPU",
+        "HANGAR",
+        "AIRCRAFT GROUND",
+        "AVIATION FUEL",
+        "MORE INFO",
+    )
+    if any(marker in upper for marker in blocked_markers):
+        return False
+    if extract_phone(text):
+        return False
+    if "," in text:
+        return False
+
+    return bool(re.search(r"[A-Za-z]", text))
+
+
+def is_probable_airnav_name_value(name: str) -> bool:
+    name = clean_text(name)
+    if not name:
+        return False
+
+    upper = name.upper()
+    blocked_markers = (
+        "WEB SITE",
+        "EMAIL",
+        "ASRI",
+        "UNICOM",
+        "AIRCARD",
+        "CONTRACT FUEL",
+        "MORE INFO",
+    )
+    if any(marker in upper for marker in blocked_markers):
+        return False
+    if extract_phone(name):
+        return False
+    if len(name) > 120:
+        return False
+
+    return bool(re.search(r"[A-Za-z]", name))
+
+
+def score_airnav_name_cell(td: Tag, airport_code: str) -> int:
+    score = 0
+    airport_code = airport_code.upper()
+
+    for a in td.find_all("a", href=True):
+        href = (a.get("href") or "").lower()
+        if f"/airport/{airport_code}/" in href:
+            score += 4
+        if clean_text(a.get_text(" ", strip=True)):
+            score += 1
+
+    for img in td.find_all("img"):
+        if clean_text(img.get("alt", "")):
+            score += 3
+
+    text = clean_text(td.get_text(" ", strip=True))
+    if is_probable_airnav_name_text(text):
+        score += 2
+
+    return score
+
+
+def find_airnav_fuel_cell(cells: List[Tag]) -> Optional[Tag]:
+    for td in cells:
+        if td.find("table") is None:
+            continue
+
+        prices, _, _ = extract_airnav_fuel_table_data(td)
+        if prices:
+            return td
+
+    return None
+
+
+def find_airnav_name_cell(cells: List[Tag], airport_code: str, fuel_td: Tag) -> Optional[Tag]:
+    for td in cells:
+        if td is fuel_td:
+            break
+
+        candidate = extract_airnav_fbo_name(td, airport_code)
+        if candidate and is_probable_airnav_name_value(candidate):
+            return td
+
+    best_td = None
+    best_score = 0
+    for td in cells:
+        if td is fuel_td:
+            break
+
+        score = score_airnav_name_cell(td, airport_code)
+        if score > best_score:
+            best_td = td
+            best_score = score
+
+    return best_td
+
+
 def extract_airnav_fuel_table_data(fuel_td: Tag) -> Tuple[Dict[str, str], bool, Optional[str]]:
     fuel_table = fuel_td.find("table")
     if fuel_table is None:
@@ -302,18 +446,21 @@ def scrape_airnav_prices_from_html(html: str, airport_code: str) -> List[Dict[st
 
     for row in get_airnav_section_rows(section_table):
         cells = row.find_all("td", recursive=False)
-        if len(cells) < 7:
+        if not cells:
             continue
 
-        biz_td = cells[0]
-        fuel_td = cells[6]
-
-        if fuel_td.find("table") is None:
+        fuel_td = find_airnav_fuel_cell(cells)
+        if fuel_td is None:
+            continue
+        biz_td = find_airnav_name_cell(cells, airport_code, fuel_td)
+        if biz_td is None:
             continue
 
         fbo_name = extract_airnav_fbo_name(biz_td, airport_code)
         if not fbo_name or fbo_name in seen_names:
             continue
+        fuel_idx = cells.index(fuel_td)
+        fbo_phone = extract_airnav_fbo_phone_from_cells(cells[:fuel_idx])
 
         prices, guaranteed, last_update_date = extract_airnav_fuel_table_data(fuel_td)
         if not prices:
@@ -322,6 +469,7 @@ def scrape_airnav_prices_from_html(html: str, airport_code: str) -> List[Dict[st
         providers.append(
             {
                 "fbo_name": fbo_name,
+                "fbo_phone": fbo_phone,
                 "last_update_date": last_update_date,
                 "guaranteed": guaranteed,
                 "prices": prices,
@@ -346,7 +494,7 @@ def extract_fltplan_provider_name(cell_text: str) -> Optional[str]:
     if not text:
         return None
 
-    m = re.match(r"^click here\s+(.+?)\s+is\b", text, flags=re.I)
+    m = re.search(r"\bclick here\s+(.+?)\s+is\b", text, flags=re.I)
     if m:
         text = clean_text(m.group(1))
         return text if text else None
@@ -393,19 +541,37 @@ def find_provider_name_above_header(rows: List[Tag], header_row_idx: int) -> Opt
         if not cells:
             continue
 
+        row_texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
+        row_joined = " ".join(t for t in row_texts if t)
+        candidate = extract_fltplan_provider_name(row_joined)
+        if candidate and candidate.lower() != row_joined.lower():
+            return candidate
+
         first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
         if not first_cell_text:
             continue
 
-        row_texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
-        row_joined = " ".join(t for t in row_texts if t).upper()
+        row_joined_upper = row_joined.upper()
 
-        if not any(marker in row_joined for marker in ["PH:", "FREQ:", "FAX:", "WEBSITE", "E-MAIL"]):
+        if not any(marker in row_joined_upper for marker in ["PH:", "FREQ:", "FAX:", "WEBSITE", "E-MAIL"]):
             continue
 
         candidate = extract_fltplan_provider_name(first_cell_text)
         if candidate:
             return candidate
+
+    return None
+
+
+def find_provider_phone_above_header(rows: List[Tag], header_row_idx: int) -> Optional[str]:
+    for j in range(header_row_idx - 1, -1, -1):
+        row_text = clean_text(rows[j].get_text(" ", strip=True))
+        if not row_text:
+            continue
+
+        phone = extract_phone(row_text)
+        if phone:
+            return phone
 
     return None
 
@@ -443,6 +609,7 @@ def parse_fltplan_table(soup: BeautifulSoup, airport_code: str) -> List[Dict[str
         provider_name = find_provider_name_above_header(rows, header_row_idx)
         if not provider_name or provider_name in seen_provider_names:
             continue
+        provider_phone = find_provider_phone_above_header(rows, header_row_idx)
 
         fuel_columns: Dict[int, str] = {}
         for idx, header_text in enumerate(header_cells_text[1:], start=1):
@@ -488,6 +655,7 @@ def parse_fltplan_table(soup: BeautifulSoup, airport_code: str) -> List[Dict[str
         providers.append(
             {
                 "fbo_name": provider_name,
+                "fbo_phone": provider_phone,
                 "last_update_date": last_update_date,
                 "guaranteed": False,
                 "prices": prices,
