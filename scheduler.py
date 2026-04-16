@@ -16,8 +16,8 @@ UPDATE_SCRIPT = str(BASE_DIR / "update_price_periods.py")
 
 # conservative defaults
 MAX_AIRPORTS_PER_RUN = 25
-MIN_DELAY_SECONDS = 9
-MAX_DELAY_SECONDS = 18
+MIN_DELAY_SECONDS = 10
+MAX_DELAY_SECONDS = 30
 
 
 def now_utc():
