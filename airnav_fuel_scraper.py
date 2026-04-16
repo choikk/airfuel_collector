@@ -26,9 +26,12 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -37,6 +40,7 @@ AIRNAV_BASE_URL = "https://www.airnav.com/airport/{code}"
 FLTPLAN_BASE_URL = "https://www.fltplan.com/Airport.cgi?{code}"
 USER_AGENT = "Mozilla/5.0 (FuelTracker/15.0)"
 TIMEOUT = 20
+AIRNAV_RETRY_DELAYS = (1.0, 2.0)
 
 SERVICE_MAP = {
     "FS": "FULL",
@@ -47,6 +51,16 @@ SERVICE_MAP = {
 }
 
 SUPPORTED_FUELS = ("100LL", "MOGAS", "UL94", "UL91", "JET_A", "SAF")
+FLTPLAN_BRAND_ALIASES = {
+    "ATLANTIC": "Atlantic Aviation",
+    "SIGNATURE": "Signature Aviation",
+}
+FLTPLAN_DOMAIN_ALIASES = {
+    "atlanticaviation.com": "Atlantic Aviation",
+    "jetaviation.com": "Jet Aviation",
+    "signatureaviation.com": "Signature Aviation",
+    "signatureflight.com": "Signature Aviation",
+}
 PHONE_RE = re.compile(
     r"(?:(?:\+?1[\s.\-]*)?)"
     r"(?:\(?\d{3}\)?[\s.\-]*)"
@@ -94,6 +108,52 @@ def fetch_url(url: str) -> str:
     )
     r.raise_for_status()
     return r.text
+
+
+def fetch_airnav_url(url: str) -> str:
+    last_error: Optional[Exception] = None
+
+    for attempt in range(len(AIRNAV_RETRY_DELAYS) + 1):
+        try:
+            return fetch_url(url)
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code is None or status_code < 500 or attempt >= len(AIRNAV_RETRY_DELAYS):
+                raise
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+            if attempt >= len(AIRNAV_RETRY_DELAYS):
+                raise
+
+        time.sleep(AIRNAV_RETRY_DELAYS[attempt])
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError("AirNav fetch failed without an exception")
+
+
+@lru_cache(maxsize=256)
+def fetch_fltplan_detail_name(url: str) -> Optional[str]:
+    try:
+        html = fetch_url(url)
+    except Exception:
+        return None
+
+    m = re.search(r"<title>(.*?)</title>", html, flags=re.I | re.S)
+    if not m:
+        return None
+
+    title = clean_text(m.group(1))
+    if " - " in title:
+        title = title.split(" - ", 1)[1]
+
+    title = clean_text(title)
+    if not title:
+        return None
+
+    return title
 
 
 def parse_price(text: str) -> Optional[float]:
@@ -203,14 +263,16 @@ def extract_airnav_fbo_name(biz_td: Tag, airport_code: str) -> Optional[str]:
         if f"/airport/{airport_code}/".lower() in href.lower():
             img = a.find("img")
             if img:
-                alt = clean_text(img.get("alt", ""))
-                if alt:
-                    return normalize_fbo_name(alt)
+                for attr in ("alt", "title"):
+                    value = clean_text(img.get(attr, ""))
+                    if value:
+                        return normalize_fbo_name(value)
 
     for img in biz_td.find_all("img"):
-        alt = clean_text(img.get("alt", ""))
-        if alt:
-            return normalize_fbo_name(alt)
+        for attr in ("alt", "title"):
+            value = clean_text(img.get(attr, ""))
+            if value:
+                return normalize_fbo_name(value)
 
     text = clean_text(biz_td.get_text(" ", strip=True))
     if text:
@@ -276,6 +338,22 @@ def is_probable_airnav_name_value(name: str) -> bool:
         "AIRCARD",
         "CONTRACT FUEL",
         "MORE INFO",
+        "WORLD FUEL",
+        "AIR ELITE",
+        "AIRBOSS",
+        "SAFETY 1ST",
+        "GOVERNMENT CONTRACT FUEL",
+        "GOVERNMENT AIR CARD",
+        "CAA PREFERRED",
+        "AEGFUELS",
+        "EVEREST FUEL",
+        "MULTI SERVICE AVIATION",
+        "GO RENTALS",
+        "HERTZ",
+        "WIFI",
+        "MEMBERS ONLY",
+        "DISCOUNTS",
+        "GUARANTEED",
     )
     if any(marker in upper for marker in blocked_markers):
         return False
@@ -285,6 +363,39 @@ def is_probable_airnav_name_value(name: str) -> bool:
         return False
 
     return bool(re.search(r"[A-Za-z]", name))
+
+
+def extract_airnav_more_info_name(cells: List[Tag], fuel_td: Tag) -> Optional[str]:
+    for td in cells:
+        if td is fuel_td:
+            break
+
+        for a in td.find_all("a", href=True):
+            text = clean_text(a.get_text(" ", strip=True))
+            if not text.lower().startswith("more info"):
+                continue
+
+            candidate = normalize_fbo_name(text)
+            if is_probable_airnav_name_value(candidate):
+                return candidate
+
+    return None
+
+
+def extract_airnav_fbo_name_from_cells(cells: List[Tag], airport_code: str, fuel_td: Tag) -> Optional[str]:
+    candidate = extract_airnav_more_info_name(cells, fuel_td)
+    if candidate:
+        return candidate
+
+    for td in cells:
+        if td is fuel_td:
+            break
+
+        candidate = extract_airnav_fbo_name(td, airport_code)
+        if candidate and is_probable_airnav_name_value(candidate):
+            return candidate
+
+    return None
 
 
 def score_airnav_name_cell(td: Tag, airport_code: str) -> int:
@@ -456,7 +567,7 @@ def scrape_airnav_prices_from_html(html: str, airport_code: str) -> List[Dict[st
         if biz_td is None:
             continue
 
-        fbo_name = extract_airnav_fbo_name(biz_td, airport_code)
+        fbo_name = extract_airnav_fbo_name_from_cells(cells, airport_code, fuel_td)
         if not fbo_name or fbo_name in seen_names:
             continue
         fuel_idx = cells.index(fuel_td)
@@ -481,7 +592,7 @@ def scrape_airnav_prices_from_html(html: str, airport_code: str) -> List[Dict[st
 
 
 def scrape_airnav_prices(airport_code: str) -> List[Dict[str, Any]]:
-    html = fetch_url(AIRNAV_BASE_URL.format(code=airport_code))
+    html = fetch_airnav_url(AIRNAV_BASE_URL.format(code=airport_code))
     return scrape_airnav_prices_from_html(html, airport_code)
 
 
@@ -494,12 +605,37 @@ def extract_fltplan_provider_name(cell_text: str) -> Optional[str]:
     if not text:
         return None
 
-    m = re.search(r"\bclick here\s+(.+?)\s+is\b", text, flags=re.I)
+    m = re.search(
+        r"\bclick here\s+(.+?)(?:\s+is\b|\s+ph:|\s+fax:|\s+freq:|\s+website\b|\s+e-mail\b|\s+service\b|\s+last update:|\s+misc\. info:|\s+address:)",
+        text,
+        flags=re.I,
+    )
     if m:
         text = clean_text(m.group(1))
         return text if text else None
 
     return text
+
+
+def normalize_fltplan_provider_name(name: str) -> Optional[str]:
+    name = clean_text(name)
+    if not name:
+        return None
+
+    upper = name.upper()
+    if upper in FLTPLAN_BRAND_ALIASES:
+        return FLTPLAN_BRAND_ALIASES[upper]
+
+    if upper == name and re.fullmatch(r"[A-Z0-9][A-Z0-9 .&()/+-]*", name):
+        parts = []
+        for token in name.split():
+            if len(token) <= 3 and token.isalpha():
+                parts.append(token.upper())
+            else:
+                parts.append(token.title())
+        name = " ".join(parts)
+
+    return name
 
 
 def fltplan_candidate_codes(airport_code: str) -> List[str]:
@@ -535,30 +671,98 @@ def normalize_fltplan_service(label: str) -> Optional[str]:
     return None
 
 
+def find_provider_name_from_links_above_header(rows: List[Tag], header_row_idx: int) -> Optional[str]:
+    for j in range(header_row_idx - 1, -1, -1):
+        for a in rows[j].find_all("a", href=True):
+            href = clean_text(a.get("href", "")).lower()
+            if not href:
+                continue
+
+            for domain, brand_name in FLTPLAN_DOMAIN_ALIASES.items():
+                if domain in href:
+                    return brand_name
+
+    return None
+
+
+def find_provider_detail_url_above_header(rows: List[Tag], header_row_idx: int) -> Optional[str]:
+    for j in range(header_row_idx - 1, -1, -1):
+        for a in rows[j].find_all("a", href=True):
+            href = clean_text(a.get("href", ""))
+            if not href:
+                continue
+            if "fbo.cfm?fid=" in href.lower():
+                return urljoin("https://www.fltplan.com/", href)
+    return None
+
+
 def find_provider_name_above_header(rows: List[Tag], header_row_idx: int) -> Optional[str]:
+    linked_brand_name = find_provider_name_from_links_above_header(rows, header_row_idx)
+    if linked_brand_name:
+        return linked_brand_name
+
+    detail_url = find_provider_detail_url_above_header(rows, header_row_idx)
+    if detail_url:
+        detail_name = fetch_fltplan_detail_name(detail_url)
+        detail_name = normalize_fltplan_provider_name(detail_name or "")
+        if detail_name:
+            return detail_name
+
+    # Prefer rows that explicitly contain the provider name/description block.
     for j in range(header_row_idx - 1, -1, -1):
         cells = rows[j].find_all(["td", "th"])
         if not cells:
             continue
 
+        for cell in cells:
+            cell_text = clean_text(cell.get_text(" ", strip=True))
+            if not cell_text:
+                continue
+
+            m = re.match(r"^([A-Z][A-Za-z0-9&'()./-]+(?: [A-Z][A-Za-z0-9&'()./-]+){0,4})\s+(?:is|offers|at)\b", cell_text)
+            if m:
+                normalized = normalize_fltplan_provider_name(m.group(1))
+                if normalized:
+                    return normalized
+
         row_texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
         row_joined = " ".join(t for t in row_texts if t)
         candidate = extract_fltplan_provider_name(row_joined)
         if candidate and candidate.lower() != row_joined.lower():
-            return candidate
+            normalized = normalize_fltplan_provider_name(candidate)
+            if normalized:
+                return normalized
+
+    # Fall back to the contact row only if no richer provider-name row exists.
+    for j in range(header_row_idx - 1, -1, -1):
+        cells = rows[j].find_all(["td", "th"])
+        if not cells:
+            continue
 
         first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
         if not first_cell_text:
             continue
 
+        row_texts = [clean_text(c.get_text(" ", strip=True)) for c in cells]
+        row_joined = " ".join(t for t in row_texts if t)
         row_joined_upper = row_joined.upper()
 
         if not any(marker in row_joined_upper for marker in ["PH:", "FREQ:", "FAX:", "WEBSITE", "E-MAIL"]):
             continue
 
+        name_candidate = clean_text(cells[0].get_text(" ", strip=True))
+        if name_candidate and not any(
+            marker in name_candidate.upper()
+            for marker in ["PH:", "FAX:", "FREQ:", "WEBSITE", "E-MAIL"]
+        ):
+            normalized = normalize_fltplan_provider_name(name_candidate)
+            if normalized:
+                return normalized
+
         candidate = extract_fltplan_provider_name(first_cell_text)
-        if candidate:
-            return candidate
+        normalized = normalize_fltplan_provider_name(candidate or "")
+        if normalized:
+            return normalized
 
     return None
 

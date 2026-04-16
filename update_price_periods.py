@@ -235,7 +235,7 @@ def insert_new_row(
     )
 
 
-def sync_open_rows_fbo_phone(cur, site_no: str, fbo_name: str, fbo_phone: str | None):
+def update_open_group_fbo_phone(cur, site_no: str, fbo_name: str, fbo_phone: str | None):
     cur.execute(
         """
         UPDATE price_periods
@@ -346,6 +346,16 @@ def group_existing_open_rows_by_fbo(existing_open_rows):
         out[fbo_name] = {
             "rows": rows,
             "fuel_family": tuple(sorted({row["fuel_type"] for row in rows})),
+            "price_signature": tuple(
+                sorted(
+                    (
+                        row["fuel_type"],
+                        row["service_type"],
+                        str(row["price"]),
+                    )
+                    for row in rows
+                )
+            ),
         }
     return out
 
@@ -361,19 +371,65 @@ def group_scraped_prices_by_fbo(scraped_prices):
         out[fbo_name] = {
             "items": items,
             "fuel_family": tuple(sorted({fuel_type for (_, fuel_type, _), _ in items})),
+            "price_signature": tuple(
+                sorted(
+                    (
+                        fuel_type,
+                        service_type,
+                        str(data["price"]),
+                    )
+                    for (__, fuel_type, service_type), data in items
+                )
+            ),
         }
     return out
+
+
+def sync_open_rows_fbo_phones(cur, site_no, existing_open_rows, scraped_prices):
+    if not existing_open_rows or not scraped_prices:
+        return
+
+    existing_groups = group_existing_open_rows_by_fbo(existing_open_rows)
+    scraped_groups = group_scraped_prices_by_fbo(scraped_prices)
+
+    for scraped_fbo_name, scraped_group in scraped_groups.items():
+        scraped_items = scraped_group["items"]
+        if not scraped_items:
+            continue
+
+        # Every provider carries one phone value for all of its prices.
+        sample_data = scraped_items[0][1]
+        fbo_phone = sample_data.get("fbo_phone")
+        if not fbo_phone:
+            continue
+
+        target_fbo_name = None
+
+        if scraped_fbo_name in existing_groups:
+            target_fbo_name = scraped_fbo_name
+        else:
+            matching_existing_fbos = [
+                existing_fbo_name
+                for existing_fbo_name, existing_group in existing_groups.items()
+                if existing_group["price_signature"] == scraped_group["price_signature"]
+            ]
+            if len(matching_existing_fbos) == 1:
+                target_fbo_name = matching_existing_fbos[0]
+
+        if target_fbo_name:
+            update_open_group_fbo_phone(cur, site_no, target_fbo_name, fbo_phone)
 
 
 def apply_fbo_name_corrections(cur, site_no, existing_open_rows, scraped_prices):
     """
     Rule:
     - Match within same airport via site_no
-    - If fuel family matches exactly but FBO name differs,
+    - If current fuel price signature matches exactly but FBO name differs,
       rename open rows instead of treating them as a different provider
 
     Safety:
-    - Only rename when exactly one candidate existing FBO group matches the fuel family
+    - Only rename when exactly one candidate existing FBO group matches the
+      current fuel price signature
     """
     if not existing_open_rows or not scraped_prices:
         return existing_open_rows
@@ -390,7 +446,7 @@ def apply_fbo_name_corrections(cur, site_no, existing_open_rows, scraped_prices)
         matching_existing_fbos = [
             old_fbo_name
             for old_fbo_name, existing_group in existing_groups.items()
-            if existing_group["fuel_family"] == scraped_group["fuel_family"]
+            if existing_group["price_signature"] == scraped_group["price_signature"]
         ]
 
         if len(matching_existing_fbos) != 1:
@@ -443,13 +499,12 @@ def process_airport(requested_airport_code: str):
 
             mark_checked(cur, canonical_airport_code, ts)
 
-            for (fbo_name, _, _), data in scraped_prices.items():
-                sync_open_rows_fbo_phone(
-                    cur,
-                    site_no,
-                    fbo_name,
-                    data["fbo_phone"],
-                )
+            sync_open_rows_fbo_phones(
+                cur,
+                site_no,
+                existing_open_rows,
+                scraped_prices,
+            )
 
             # If airport has no open rows yet, insert all scraped prices
             if not existing_open_rows:
