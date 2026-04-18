@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import random
 import subprocess
@@ -84,7 +85,8 @@ def fetch_due_airports(cur, limit: int):
         SELECT
             a.airport_code,
             a.airspace_class,
-            COALESCE(s.consecutive_no_change_count, 0) AS consecutive_no_change_count
+            COALESCE(s.consecutive_no_change_count, 0) AS consecutive_no_change_count,
+            COALESCE(s.check_priority, 2) AS current_priority
         FROM airports_v2 a
         LEFT JOIN airport_scrape_status_v2 s
           ON s.airport_code = a.airport_code
@@ -106,6 +108,19 @@ def fetch_due_airports(cur, limit: int):
         (limit,),
     )
     return cur.fetchall()
+
+
+def get_scheduler_priority(cur, airport_code: str) -> int:
+    cur.execute(
+        """
+        SELECT COALESCE(check_priority, 2)
+        FROM airport_scrape_status_v2
+        WHERE airport_code = %s
+        """,
+        (airport_code,),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row else 2
 
 
 def get_site_no_for_airport(cur, airport_code: str) -> str:
@@ -146,6 +161,38 @@ def get_price_snapshot(cur, airport_code: str):
     )
     rows = cur.fetchall()
     return tuple(rows)
+
+
+def snapshot_to_price_map(snapshot):
+    return {
+        (fbo_name, fuel_type, service_type): price
+        for fbo_name, fuel_type, service_type, price in snapshot
+    }
+
+
+def diff_price_snapshots(before_snapshot, after_snapshot):
+    before_map = snapshot_to_price_map(before_snapshot)
+    after_map = snapshot_to_price_map(after_snapshot)
+    changes = []
+
+    for key in sorted(before_map.keys() & after_map.keys()):
+        old_price = before_map[key]
+        new_price = after_map[key]
+        if old_price == new_price:
+            continue
+
+        fbo_name, fuel_type, service_type = key
+        changes.append(
+            {
+                "fbo_name": fbo_name,
+                "fuel_type": fuel_type,
+                "service_type": service_type,
+                "old_price": str(old_price),
+                "new_price": str(new_price),
+            }
+        )
+
+    return changes
 
 
 def update_airport_schedule(
@@ -252,11 +299,20 @@ def run_update_script(airport_code: str):
     return result
 
 
+def scraped_has_prices(scraped: dict) -> bool:
+    for provider in scraped.get("providers", []):
+        for value in (provider.get("prices") or {}).values():
+            if value not in (None, "", "-", "--", "---"):
+                return True
+    return False
+
+
 def process_one_airport(
     conn,
     airport_code: str,
     airspace_class: str | None,
     consecutive_no_change_count: int,
+    current_priority: int,
 ):
     with conn.cursor() as cur:
         before_snapshot = get_price_snapshot(cur, airport_code)
@@ -270,6 +326,18 @@ def process_one_airport(
             f"STDERR:\n{result.stderr}"
         )
 
+    scraped = json.loads(result.stdout)
+    if not scraped_has_prices(scraped):
+        with conn.cursor() as cur:
+            after_priority = get_scheduler_priority(cur, airport_code)
+        return {
+            "changed": False,
+            "no_prices_found": True,
+            "before_priority": current_priority,
+            "after_priority": after_priority,
+            "price_changes": [],
+        }
+
     with conn.cursor() as cur:
         after_snapshot = get_price_snapshot(cur, airport_code)
         changed = before_snapshot != after_snapshot
@@ -281,9 +349,16 @@ def process_one_airport(
             airspace_class=airspace_class,
             old_no_change_count=consecutive_no_change_count,
         )
+        after_priority = get_scheduler_priority(cur, airport_code)
 
     conn.commit()
-    return changed
+    return {
+        "changed": changed,
+        "no_prices_found": False,
+        "before_priority": current_priority,
+        "after_priority": after_priority,
+        "price_changes": diff_price_snapshots(before_snapshot, after_snapshot),
+    }
 
 
 def main():
@@ -303,22 +378,48 @@ def main():
             print("No airports due.")
             return
 
-        for idx, (airport_code, airspace_class, consecutive_no_change_count) in enumerate(due_airports, start=1):
-            print(f"[{idx}/{len(due_airports)}] Processing {airport_code} ...")
+        for idx, (airport_code, airspace_class, consecutive_no_change_count, current_priority) in enumerate(due_airports, start=1):
+            print(
+                f"[{idx}/{len(due_airports)}] Processing {airport_code} "
+                f"(priority {current_priority}) ..."
+            )
 
             try:
-                changed = process_one_airport(
+                result = process_one_airport(
                     conn,
                     airport_code=airport_code,
                     airspace_class=airspace_class,
                     consecutive_no_change_count=consecutive_no_change_count,
+                    current_priority=current_priority,
                 )
-                if changed:
+                before_priority = result["before_priority"]
+                after_priority = result["after_priority"]
+
+                if result["no_prices_found"]:
+                    unchanged_count += 1
+                    print(
+                        f"  no FBO/prices found: {airport_code} "
+                        f"(priority {before_priority} -> {after_priority})"
+                    )
+                elif result["changed"]:
                     changed_count += 1
-                    print(f"  changed: {airport_code}")
+                    print(
+                        f"  changed: {airport_code} "
+                        f"(priority {before_priority} -> {after_priority})"
+                    )
+                    for price_change in result["price_changes"]:
+                        print(
+                            "    "
+                            f"{price_change['fbo_name']} "
+                            f"{price_change['fuel_type']}_{price_change['service_type']}: "
+                            f"{price_change['old_price']} -> {price_change['new_price']}"
+                        )
                 else:
                     unchanged_count += 1
-                    print(f"  unchanged: {airport_code}")
+                    print(
+                        f"  unchanged: {airport_code} "
+                        f"(priority {before_priority} -> {after_priority})"
+                    )
 
                 processed += 1
 
@@ -326,8 +427,13 @@ def main():
                 conn.rollback()
                 with conn.cursor() as cur:
                     record_attempt_only(cur, airport_code)
+                    after_priority = get_scheduler_priority(cur, airport_code)
                 conn.commit()
-                print(f"  failed: {airport_code}: {e}", file=sys.stderr)
+                print(
+                    f"  failed: {airport_code} "
+                    f"(priority {current_priority} -> {after_priority}): {e}",
+                    file=sys.stderr,
+                )
 
             if idx < len(due_airports):
                 delay = random_delay_seconds()
