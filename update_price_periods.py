@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -14,6 +14,9 @@ from psycopg import connect
 DATABASE_URL = os.environ["NEON_DATABASE_URL"]
 BASE_DIR = Path(__file__).resolve().parent
 SCRAPER_PATH = str(BASE_DIR / "airnav_fuel_scraper.py")
+NO_FBO_CHECK_PRIORITY = 10
+NO_FBO_MAX_CHECK_PRIORITY = 20
+NO_FBO_RECHECK_DAYS = 21
 
 
 def now_utc():
@@ -300,24 +303,37 @@ def normalize_scraped_prices(scraped: dict):
 def bump_check_priority_only(cur, airport_code: str, checked_at):
     """
     No prices found from AirNav/FltPlan.
-    Bump scheduler priority in airport_scrape_status_v2.
+    Heavily deprioritize the airport in airport_scrape_status_v2.
     """
+    next_check_at = checked_at + timedelta(days=NO_FBO_RECHECK_DAYS)
     cur.execute(
         """
         INSERT INTO airport_scrape_status_v2 (
             airport_code,
             last_checked_at,
+            next_check_at,
             check_priority
         )
-        VALUES (%s, %s, 3)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT (airport_code) DO UPDATE
         SET last_checked_at = EXCLUDED.last_checked_at,
+            next_check_at = GREATEST(
+                COALESCE(airport_scrape_status_v2.next_check_at, EXCLUDED.next_check_at),
+                EXCLUDED.next_check_at
+            ),
             check_priority = LEAST(
-                COALESCE(airport_scrape_status_v2.check_priority, 2) + 1,
-                5
+                GREATEST(COALESCE(airport_scrape_status_v2.check_priority, 2), %s) + 2,
+                %s
             )
         """,
-        (airport_code, checked_at),
+        (
+            airport_code,
+            checked_at,
+            next_check_at,
+            NO_FBO_CHECK_PRIORITY,
+            NO_FBO_CHECK_PRIORITY,
+            NO_FBO_MAX_CHECK_PRIORITY,
+        ),
     )
 
 

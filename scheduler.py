@@ -185,6 +185,10 @@ def update_airport_schedule(
             ON CONFLICT (airport_code) DO UPDATE
             SET last_checked_at = EXCLUDED.last_checked_at,
                 next_check_at = EXCLUDED.next_check_at,
+                check_priority = CASE
+                    WHEN COALESCE(airport_scrape_status_v2.check_priority, 2) >= 10 THEN 3
+                    ELSE LEAST(COALESCE(airport_scrape_status_v2.check_priority, 2) + 1, 3)
+                END,
                 last_change_at = EXCLUDED.last_change_at,
                 consecutive_no_change_count = EXCLUDED.consecutive_no_change_count
             """,
@@ -204,6 +208,10 @@ def update_airport_schedule(
             ON CONFLICT (airport_code) DO UPDATE
             SET last_checked_at = EXCLUDED.last_checked_at,
                 next_check_at = EXCLUDED.next_check_at,
+                check_priority = CASE
+                    WHEN COALESCE(airport_scrape_status_v2.check_priority, 2) >= 10 THEN 3
+                    ELSE LEAST(COALESCE(airport_scrape_status_v2.check_priority, 2) + 1, 3)
+                END,
                 consecutive_no_change_count = EXCLUDED.consecutive_no_change_count
             """,
             (airport_code, current_ts, next_check_at, next_count),
