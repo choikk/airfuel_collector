@@ -218,6 +218,31 @@ def update_airport_schedule(
         )
 
 
+def record_attempt_only(cur, airport_code: str):
+    """
+    Even if update_price_periods.py failed to apply changes, record that the
+    scheduler attempted this airport and bump the scheduler priority.
+    """
+    current_ts = now_utc()
+    cur.execute(
+        """
+        INSERT INTO airport_scrape_status_v2 (
+            airport_code,
+            last_checked_at,
+            check_priority
+        )
+        VALUES (%s, %s, 2)
+        ON CONFLICT (airport_code) DO UPDATE
+        SET last_checked_at = EXCLUDED.last_checked_at,
+            check_priority = CASE
+                WHEN COALESCE(airport_scrape_status_v2.check_priority, 2) >= 10 THEN 3
+                ELSE LEAST(COALESCE(airport_scrape_status_v2.check_priority, 2) + 1, 3)
+            END
+        """,
+        (airport_code, current_ts),
+    )
+
+
 def run_update_script(airport_code: str):
     result = subprocess.run(
         [sys.executable, UPDATE_SCRIPT, airport_code],
@@ -299,6 +324,9 @@ def main():
 
             except Exception as e:
                 conn.rollback()
+                with conn.cursor() as cur:
+                    record_attempt_only(cur, airport_code)
+                conn.commit()
                 print(f"  failed: {airport_code}: {e}", file=sys.stderr)
 
             if idx < len(due_airports):

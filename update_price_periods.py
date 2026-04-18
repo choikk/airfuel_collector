@@ -15,7 +15,6 @@ DATABASE_URL = os.environ["NEON_DATABASE_URL"]
 BASE_DIR = Path(__file__).resolve().parent
 SCRAPER_PATH = str(BASE_DIR / "airnav_fuel_scraper.py")
 NO_FBO_CHECK_PRIORITY = 10
-NO_FBO_MAX_CHECK_PRIORITY = 20
 NO_FBO_RECHECK_DAYS = 21
 
 
@@ -303,7 +302,7 @@ def normalize_scraped_prices(scraped: dict):
 def bump_check_priority_only(cur, airport_code: str, checked_at):
     """
     No prices found from AirNav/FltPlan.
-    Heavily deprioritize the airport in airport_scrape_status_v2.
+    Deprioritize the airport in airport_scrape_status_v2.
     """
     next_check_at = checked_at + timedelta(days=NO_FBO_RECHECK_DAYS)
     cur.execute(
@@ -321,10 +320,7 @@ def bump_check_priority_only(cur, airport_code: str, checked_at):
                 COALESCE(airport_scrape_status_v2.next_check_at, EXCLUDED.next_check_at),
                 EXCLUDED.next_check_at
             ),
-            check_priority = LEAST(
-                GREATEST(COALESCE(airport_scrape_status_v2.check_priority, 2), %s) + 2,
-                %s
-            )
+            check_priority = %s
         """,
         (
             airport_code,
@@ -332,7 +328,6 @@ def bump_check_priority_only(cur, airport_code: str, checked_at):
             next_check_at,
             NO_FBO_CHECK_PRIORITY,
             NO_FBO_CHECK_PRIORITY,
-            NO_FBO_MAX_CHECK_PRIORITY,
         ),
     )
 
