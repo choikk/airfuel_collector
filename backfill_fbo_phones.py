@@ -90,14 +90,14 @@ def parse_args():
     parser.add_argument(
         "--min-delay-seconds",
         type=float,
-        default=2.0,
-        help="Minimum delay between airports; default 2 seconds",
+        default=5.0,
+        help="Minimum delay between airports; default 5 seconds",
     )
     parser.add_argument(
         "--max-delay-seconds",
         type=float,
-        default=5.0,
-        help="Maximum delay between airports; default 5 seconds",
+        default=15.0,
+        help="Maximum delay between airports; default 15 seconds",
     )
     return parser.parse_args()
 

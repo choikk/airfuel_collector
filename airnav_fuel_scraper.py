@@ -24,6 +24,7 @@ Behavior:
 from __future__ import annotations
 
 import json
+import random
 import re
 import sys
 import time
@@ -40,7 +41,9 @@ AIRNAV_BASE_URL = "https://www.airnav.com/airport/{code}"
 FLTPLAN_BASE_URL = "https://www.fltplan.com/Airport.cgi?{code}"
 USER_AGENT = "Mozilla/5.0 (FuelTracker/15.0)"
 TIMEOUT = 20
-AIRNAV_RETRY_DELAYS = (1.0, 2.0)
+# Be conservative with AirNav when it returns transient server errors.
+AIRNAV_RETRY_DELAYS = (2.0, 5.0, 10.0)
+AIRNAV_RETRY_JITTER_SECONDS = 0.75
 
 SERVICE_MAP = {
     "FS": "FULL",
@@ -126,7 +129,8 @@ def fetch_airnav_url(url: str) -> str:
             if attempt >= len(AIRNAV_RETRY_DELAYS):
                 raise
 
-        time.sleep(AIRNAV_RETRY_DELAYS[attempt])
+        delay = AIRNAV_RETRY_DELAYS[attempt] + random.uniform(0.0, AIRNAV_RETRY_JITTER_SECONDS)
+        time.sleep(delay)
 
     if last_error:
         raise last_error
