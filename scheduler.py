@@ -429,8 +429,11 @@ def main():
             print("No airports due.")
             return
 
-        for idx, (airport_code, airspace_class, consecutive_no_change_count) in enumerate(due_airports, start=1):
-            print(f"[{idx}/{len(due_airports)}] Processing {airport_code} ...")
+        for idx, (airport_code, airspace_class, consecutive_no_change_count, current_priority) in enumerate(due_airports, start=1):
+            print(
+                f"[{idx}/{len(due_airports)}] Processing {airport_code} "
+                f"(priority {current_priority}) ..."
+            )
 
             try:
                 changed = process_one_airport(
