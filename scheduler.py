@@ -70,8 +70,134 @@ def compute_next_check_at(
 
     return now_utc() + timedelta(days=days)
 
-
 def fetch_due_airports(cur, limit: int):
+    """
+    Allocate scheduler slots by priority buckets:
+    - priority 1 gets at least 30%
+    - priority 2 gets the next 30%
+    - priority 3 gets the next 30%
+    - the remaining 10% goes to priority >= 3 using next_check_at only
+
+    Ordering priority:
+    - within priority 1/2/3 buckets: overdue airports first, then earlier next_check_at
+    - within the final 10% bucket: next_check_at only
+    """
+    if limit <= 0:
+        return []
+
+    priority_one_limit = max(1, int(limit * 0.30))
+    if priority_one_limit > limit:
+        priority_one_limit = limit
+    priority_two_limit = min(int(limit * 0.30), max(limit - priority_one_limit, 0))
+    priority_three_limit = min(
+        int(limit * 0.30),
+        max(limit - priority_one_limit - priority_two_limit, 0),
+    )
+    bonus_limit = max(
+        limit - priority_one_limit - priority_two_limit - priority_three_limit,
+        0,
+    )
+
+    cur.execute(
+        """
+        SELECT
+            a.airport_code,
+            airspace_class,
+            COALESCE(s.consecutive_no_change_count, 0) AS consecutive_no_change_count,
+            COALESCE(s.check_priority, 2) AS current_priority,
+            s.last_checked_at,
+            s.next_check_at
+        FROM airports_v2 a
+        LEFT JOIN airport_scrape_status_v2 s
+          ON s.airport_code = a.airport_code
+        WHERE a.fuel_raw IS NOT NULL
+          AND btrim(a.fuel_raw) <> ''
+          AND upper(btrim(a.fuel_raw)) <> 'NONE'
+        """,
+    )
+    candidates = cur.fetchall()
+
+    current_ts = now_utc()
+    min_ts = datetime.min.replace(tzinfo=timezone.utc)
+    selected_codes = set()
+
+    def due_bucket(row):
+        next_check_at = row[5]
+        return 0 if next_check_at is None or next_check_at <= current_ts else 1
+
+    def next_check_sort_value(row):
+        next_check_at = row[5]
+        return next_check_at if next_check_at is not None else min_ts
+
+    def last_checked_sort_value(row):
+        last_checked_at = row[4]
+        return last_checked_at if last_checked_at is not None else min_ts
+
+    def bucket_sort_key(row):
+        return (
+            due_bucket(row),
+            next_check_sort_value(row),
+            last_checked_sort_value(row),
+            row[0],
+        )
+
+    def bonus_sort_key(row):
+        return (
+            next_check_sort_value(row),
+            last_checked_sort_value(row),
+            row[0],
+        )
+
+    def fallback_sort_key(row):
+        return (
+            row[3],
+            due_bucket(row),
+            next_check_sort_value(row),
+            last_checked_sort_value(row),
+            row[0],
+        )
+
+    def take_rows(rows, quota):
+        picked = []
+        for row in rows:
+            if row[0] in selected_codes:
+                continue
+            picked.append(row)
+            selected_codes.add(row[0])
+            if len(picked) >= quota:
+                break
+        return picked
+
+    priority_one_rows = sorted(
+        [row for row in candidates if row[3] == 1],
+        key=bucket_sort_key,
+    )
+    priority_two_rows = sorted(
+        [row for row in candidates if row[3] == 2],
+        key=bucket_sort_key,
+    )
+    priority_three_rows = sorted(
+        [row for row in candidates if row[3] == 3],
+        key=bucket_sort_key,
+    )
+    bonus_rows = sorted(
+        [row for row in candidates if row[3] >= 3],
+        key=bonus_sort_key,
+    )
+
+    selected = []
+    selected.extend(take_rows(priority_one_rows, priority_one_limit))
+    selected.extend(take_rows(priority_two_rows, priority_two_limit))
+    selected.extend(take_rows(priority_three_rows, priority_three_limit))
+    selected.extend(take_rows(bonus_rows, bonus_limit))
+
+    if len(selected) < limit:
+        remaining_rows = sorted(candidates, key=fallback_sort_key)
+        selected.extend(take_rows(remaining_rows, limit - len(selected)))
+
+    return [row[:4] for row in selected[:limit]]
+
+def fetch_due_airports1(cur, limit: int):
     """
     Use airports_v2 for airport metadata and airport_scrape_status_v2
     for scheduler state.
