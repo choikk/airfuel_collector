@@ -2,7 +2,7 @@ name: Fuel Collector Scheduler
 
 on:
   schedule:
-    - cron: "15 * * * *"
+    - cron: "16 * * * *"
   workflow_dispatch:
 
 jobs:
